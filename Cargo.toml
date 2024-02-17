@@ -1,0 +1,93 @@
+[package]
+name = "kiso"
+version = "0.0.0"
+authors = ["Luis Holanda <luiscmholanda@gmail.com>"]
+edition = "2021"
+description = "A foundation for gRPC services"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+axum = { version = "0.6.20", default-features = false }
+clap = { version = "4.4.18", features = ["derive"] }
+futures-util = "0.3.30"
+hyper = { version = "0.14.26", features = ["server", "http2"] }
+num_cpus = "1.16.0"
+once_cell = { version = "1.19.0", default-features = false, features = ["parking_lot", "alloc", "std"] }
+socket2 = { version = "0.5.5", features = ["all"] }
+tonic-health = { version = "0.10.2", default-features = false }
+tower = { version = "0.4.13", default-features = false }
+tower-http = { version = "0.4.4", features = ["sensitive-headers"] }
+
+[dependencies.nix]
+version = "0.27.1"
+features = ["sched"]
+
+[dependencies.tokio]
+version = "1.36.0"
+default-features = false
+features = ["full"]
+
+[dependencies.tonic]
+version = "0.10.2"
+default-features = false
+features = ["codegen", "prost", "gzip"]
+
+[lints.rust]
+rust_2018_idioms = "deny"
+
+let_underscore_drop = "warn"
+unused_imports = "warn"
+variant_size_differences = "warn"
+
+[lints.clippy]
+# Allows
+use_self = "allow"
+diverging_sub_expression = "allow"
+
+# Denies
+extra_unused_lifetimes = "deny"
+mod_module_files = "deny"
+
+# Warns
+
+checked_conversions = "warn"
+cloned_instead_of_copied = "warn"
+cognitive_complexity = "warn"
+dbg_macro = "warn"
+decimal_literal_representation = "warn"
+empty_enum = "warn"
+enum_glob_use = "warn"
+equatable_if_let = "warn"
+explicit_deref_methods = "warn"
+explicit_into_iter_loop = "warn"
+explicit_iter_loop = "warn"
+filter_map_next = "warn"
+fn_params_excessive_bools = "warn"
+if_not_else = "warn"
+implicit_clone = "warn"
+implicit_saturating_sub = "warn"
+imprecise_flops = "warn"
+index_refutable_slice = "warn"
+items_after_statements = "warn"
+large_types_passed_by_value = "warn"
+let_unit_value = "warn"
+manual_filter_map = "warn"
+manual_find_map = "warn"
+manual_let_else = "warn"
+manual_ok_or = "warn"
+manual_unwrap_or = "warn"
+map_flatten = "warn"
+map_unwrap_or = "warn"
+match_same_arms = "warn"
+missing_errors_doc = "warn"
+mut_mut = "warn"
+needless_continue = "warn"
+needless_pass_by_value = "warn"
+ref_option_ref = "warn"
+result_large_err = "warn"
+single_match_else = "warn"
+suspicious_operation_groupings = "warn"
+type_repetition_in_bounds = "warn"
+unnecessary_sort_by = "warn"
+unnecessary_wraps = "warn"
+useless_format = "warn"
