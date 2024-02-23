@@ -10,13 +10,17 @@ license = "MIT OR Apache-2.0"
 axum = { version = "0.6.20", default-features = false }
 clap = { version = "4.4.18", features = ["derive"] }
 futures-util = "0.3.30"
-hyper = { version = "0.14.26", features = ["server", "http2"] }
+hickory-resolver = "0.24.0"
+http-body = "0.4.6"
+hyper = { version = "0.14.26", features = ["client", "server", "http2", "runtime"] }
 num_cpus = "1.16.0"
 once_cell = { version = "1.19.0", default-features = false, features = ["parking_lot", "alloc", "std"] }
+rustls = "0.22.0"
+rustls-native-certs = "0.7.0"
 socket2 = { version = "0.5.5", features = ["all"] }
+tokio-rustls = "0.25.0"
 tonic-health = { version = "0.10.2", default-features = false }
 tower = { version = "0.4.13", default-features = false }
-tower-http = { version = "0.4.4", features = ["sensitive-headers"] }
 
 [dependencies.nix]
 version = "0.27.1"
@@ -31,6 +35,15 @@ features = ["full"]
 version = "0.10.2"
 default-features = false
 features = ["codegen", "prost", "gzip"]
+
+[dependencies.tower-http]
+version = "0.4.4"
+features = [
+  "sensitive-headers",
+  "decompression-gzip",
+  "decompression-zstd",
+  "timeout",
+]
 
 [lints.rust]
 rust_2018_idioms = "deny"

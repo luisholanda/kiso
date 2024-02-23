@@ -39,7 +39,8 @@ pub struct CmdDescriptor {
 /// For examples, see the structs defined in this crate.
 #[macro_export]
 macro_rules! settings {
-    ($vis: vis $ty_name: ident { $($(#[$meta: meta])+ $setting: ident : $ty: ty $(= $default: expr)? ,)+ }) => {
+    ($(#[$ty_meta: meta])* $vis: vis $ty_name: ident { $($(#[$meta: meta])+ $setting: ident : $ty: ty $(= $default: expr)? ,)+ }) => {
+        $(#[$ty_meta])*
         #[derive($crate::settings::__Parser)]
         $vis struct $ty_name {
             $(
@@ -92,7 +93,9 @@ impl SettingsBuilder {
 
     /// Build a [`Settings`] with the configured parser from the command line
     /// arguments given to the executable.
-    pub fn install_from_args(self) {
+    pub fn install_from_args(mut self) {
+        self = self.register::<crate::clients::HttpsClientSettings>();
+
         let settings = Settings {
             cmdline_matches: self.cmd.get_matches(),
         };
