@@ -94,7 +94,9 @@ impl SettingsBuilder {
     /// Build a [`Settings`] with the configured parser from the command line
     /// arguments given to the executable.
     pub fn install_from_args(mut self) {
-        self = self.register::<crate::clients::HttpsClientSettings>();
+        self = self
+            .register::<crate::clients::HttpsClientSettings>()
+            .register::<crate::server::ServerSettings>();
 
         let settings = Settings {
             cmdline_matches: self.cmd.get_matches(),

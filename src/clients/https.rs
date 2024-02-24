@@ -147,11 +147,11 @@ crate::settings!(
         /// Defaults to 10s.
         #[arg(value_parser = crate::settings::DurationParser)]
         https_client_default_timeout: Duration = Duration::from_secs(10),
-        /// Extra request headers to mark as sensitive.
+        /// Extra client request headers to mark as sensitive.
         ///
         /// "Authorization", "Proxy-Authorization" and "Cookie" are already marked as sensitive.
         https_client_extra_request_sensitive_headers: Vec<String>,
-        /// Extra response headers to mark as sensitive.
+        /// Extra client response headers to mark as sensitive.
         ///
         /// "Set-Cookie" is already marked as sensitive.
         https_client_extra_response_sensitive_headers: Vec<String>,

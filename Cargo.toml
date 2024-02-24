@@ -20,7 +20,6 @@ rustls-native-certs = "0.7.0"
 socket2 = { version = "0.5.5", features = ["all"] }
 tokio-rustls = "0.25.0"
 tonic-health = { version = "0.10.2", default-features = false }
-tower = { version = "0.4.13", default-features = false }
 
 [dependencies.nix]
 version = "0.27.1"
@@ -36,10 +35,20 @@ version = "0.10.2"
 default-features = false
 features = ["codegen", "prost", "gzip"]
 
+[dependencies.tower]
+version = "0.4.13"
+default-features = false
+features = [
+  "limit",
+  "load-shed",
+]
+
 [dependencies.tower-http]
 version = "0.4.4"
 features = [
   "sensitive-headers",
+  "compression-gzip",
+  "compression-zstd",
   "decompression-gzip",
   "decompression-zstd",
   "timeout",
