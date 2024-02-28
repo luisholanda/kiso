@@ -5,3 +5,5 @@ pub mod rt;
 pub mod server;
 /// Application settings.
 pub mod settings;
+
+pub mod observability;
