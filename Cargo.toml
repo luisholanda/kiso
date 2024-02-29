@@ -18,6 +18,7 @@ num_cpus = "1.16.0"
 once_cell = { version = "1.19.0", default-features = false, features = ["parking_lot", "alloc", "std"] }
 opentelemetry = { version = "0.22.0", features = ["logs", "trace"] }
 opentelemetry_sdk = { version = "0.22.0", features = ["logs", "trace", "rt-tokio"] }
+opentelemetry-semantic-conventions = "0.14.0"
 rustls = "0.22.0"
 rustls-native-certs = "0.7.0"
 socket2 = { version = "0.5.5", features = ["all"] }

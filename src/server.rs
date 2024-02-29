@@ -95,10 +95,18 @@ impl Server {
     ///
     /// Returns a [`Shutdown`] that can be used to gracefully shutdown the server.
     pub async fn start(&mut self) -> Shutdown {
+        crate::info!("Starting server...");
+
         if self.grpc_enabled {
+            crate::debug!("gRPC enabled, adding gprc.health.v1.Health service for health checking");
             let (_, srv) = tonic_health::server::health_reporter();
             self.add_grpc_service(srv);
         }
+
+        crate::debug!(
+            "Server will have a {} connection limit",
+            self.settings.server_connection_limit
+        );
 
         let conn_limit = Arc::new(Semaphore::new(self.settings.server_connection_limit));
 
@@ -123,7 +131,12 @@ impl Server {
 
         let notify = Arc::new(Notify::new());
 
-        let mut futs = Vec::with_capacity(self.settings.server_connection_limit);
+        crate::info!(
+            "Starting server tasks, {} will be created",
+            self.settings.server_acceptor_tasks_count
+        );
+
+        let mut futs = Vec::with_capacity(self.settings.server_acceptor_tasks_count as _);
         for _ in 0..self.settings.server_acceptor_tasks_count {
             futs.push(async {
                 let listener = self.listen().await;
@@ -149,6 +162,12 @@ impl Server {
     }
 
     async fn listen(&self) -> TcpListener {
+        crate::debug!(
+            "Starting listener in {}:{}",
+            self.settings.server_ip,
+            self.settings.server_port
+        );
+
         let sock_addr = SocketAddr::new(self.settings.server_ip, self.settings.server_port);
 
         let listener = match TcpListener::bind(sock_addr).await {

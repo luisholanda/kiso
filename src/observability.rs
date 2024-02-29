@@ -11,6 +11,7 @@ use opentelemetry_sdk::{
 use self::worker::{Command, Worker, WorkerConfig};
 
 pub mod logging;
+pub mod tracing;
 
 mod worker;
 
@@ -44,6 +45,7 @@ where
             .build(),
         cmd_channel_capacity: settings.observability_buffer_capacity,
         resource_detection_timeout: settings.observability_resource_detection_timeout,
+        initial_spans_capacity: settings.observability_tracing_initial_spans_buffer_size,
     });
 
     CMD_SENDER
@@ -73,16 +75,15 @@ crate::settings!(ObservabilitySettings {
     observability_logging_batch_max_export_timeout: Duration = Duration::from_secs(30),
     ///
     observability_logging_batch_max_export_batch_size: usize = 512,
+    ///
+    observability_tracing_initial_spans_buffer_size: usize = 2048,
 });
 
 static CMD_SENDER: OnceCell<Sender<Command>> = OnceCell::new();
 
 fn send_cmd(cmd: Command) {
-    let sender = if cfg!(debug_assertions) {
-        CMD_SENDER.get().expect("observability stack not enabled")
-    } else {
-        // SAFETY: the stack assumes it is enabled.
-        unsafe { CMD_SENDER.get_unchecked() }
+    let Some(sender) = CMD_SENDER.get() else {
+        return;
     };
 
     if let Err(TrySendError::Full(cmd)) = sender.try_send(cmd) {
