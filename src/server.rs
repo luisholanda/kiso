@@ -87,7 +87,8 @@ impl Server {
 
         self.grpc_enabled = true;
         // TODO(grpc): add gRPC default middleware stack.
-        self.router = std::mem::take(&mut self.router).route_service(S::NAME, service);
+        self.router = std::mem::take(&mut self.router)
+            .route_service(&format!("/{}/:method", S::NAME), service);
         self
     }
 
