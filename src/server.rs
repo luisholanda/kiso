@@ -11,7 +11,7 @@ use clap::builder::TypedValueParser;
 use hyper::{
     header,
     server::conn::{AddrIncoming, AddrStream},
-    Body, Request,
+    Body, Request, Response,
 };
 use tokio::{
     net::TcpListener,
@@ -104,6 +104,15 @@ impl Server {
             crate::debug!("gRPC enabled, adding gprc.health.v1.Health service for health checking");
             let (_, srv) = tonic_health::server::health_reporter();
             self.add_grpc_service(srv);
+        } else {
+            crate::debug!(
+                "No gRPC service found, adding HTPT route '{}' for health checking",
+                self.settings.server_http_health_checking_route
+            );
+            self.router = std::mem::take(&mut self.router).route(
+                &self.settings.server_http_health_checking_route,
+                axum::routing::get(|| std::future::ready(Response::new(Body::empty()))),
+            );
         }
 
         crate::debug!("Server settings: {:?}", self.settings);
@@ -281,6 +290,8 @@ crate::settings! {
         /// Defaults to 5s.
         #[arg(value_parser = crate::settings::DurationParser)]
         server_linger_timeout: Duration = Duration::from_secs(5),
+        /// HTTP route to use for health checking when no gRPC service is enabled.
+        server_http_health_checking_route: String = "/health".to_string(),
         /// If the server should require HTTP/2 connections.
         ///
         /// Note that gRPC requires HTTP/2, thus, adding any gRPC service to the server
