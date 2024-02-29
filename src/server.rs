@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use axum::{response::IntoResponse, routing::IntoMakeService};
+use axum::response::IntoResponse;
 use clap::builder::TypedValueParser;
 use hyper::{
     header,
@@ -60,6 +60,8 @@ impl Server {
     /// The routes are nested in the given path, i.e. if the router contains
     /// a route `/bar` and `path` is `/foo`, the route will be available in `/foo/bar`.
     pub fn add_routes(&mut self, path: &str, router: axum::Router) -> &mut Self {
+        crate::debug!("Mounting HTTP routes under {path}");
+
         // TODO(http): add HTTP default middleware stack.
         self.router = std::mem::take(&mut self.router).nest(path, router);
         self
@@ -82,6 +84,8 @@ impl Server {
         S::Response: IntoResponse,
         S::Future: Send,
     {
+        crate::debug!("Mounting gRPC service {}", S::NAME);
+
         self.grpc_enabled = true;
         // TODO(grpc): add gRPC default middleware stack.
         self.router = std::mem::take(&mut self.router).route_service(S::NAME, service);
@@ -103,38 +107,15 @@ impl Server {
             self.add_grpc_service(srv);
         }
 
-        crate::debug!(
-            "Server will have a {} connection limit",
-            self.settings.server_connection_limit
-        );
-
-        let conn_limit = Arc::new(Semaphore::new(self.settings.server_connection_limit));
-
-        let mut router_mk_srv = self.make_service();
-
-        let settings = self.settings.clone();
-        let service = tower::ServiceBuilder::new()
-            .load_shed()
-            .layer(GlobalConcurrencyLimitLayer::with_semaphore(conn_limit))
-            .service_fn(move |stream: &AddrStream| {
-                let _res = (|| unsafe {
-                    let socket = socket2::Socket::from_raw_fd(stream.as_raw_fd());
-                    socket.set_nodelay(true)?;
-                    socket.set_thin_linear_timeouts(true)?;
-                    socket.set_linger(Some(settings.server_linger_timeout))?;
-
-                    Ok(()) as std::io::Result<()>
-                })();
-
-                router_mk_srv.call(stream)
-            });
-
-        let notify = Arc::new(Notify::new());
+        crate::debug!("Server settings: {:?}", self.settings);
 
         crate::info!(
             "Starting server tasks, {} will be created",
             self.settings.server_acceptor_tasks_count
         );
+
+        let notify = Arc::new(Notify::new());
+        let service = self.make_service();
 
         let mut futs = Vec::with_capacity(self.settings.server_acceptor_tasks_count as _);
         for _ in 0..self.settings.server_acceptor_tasks_count {
@@ -157,6 +138,12 @@ impl Server {
         }
 
         futures_util::future::join_all(futs).await;
+
+        crate::info!(
+            "Server started! Listening on {}:{}",
+            self.settings.server_ip,
+            self.settings.server_port
+        );
 
         Shutdown(notify)
     }
@@ -188,7 +175,16 @@ impl Server {
         listener
     }
 
-    fn make_service(&self) -> IntoMakeService<axum::Router> {
+    fn make_service(
+        &self,
+    ) -> tower::load_shed::LoadShed<
+        tower::limit::ConcurrencyLimit<
+            tower::util::ServiceFn<
+                impl FnMut(&AddrStream) -> axum::routing::future::IntoMakeServiceFuture<axum::Router>
+                    + Clone,
+            >,
+        >,
+    > {
         let mut req_sensitive_hdrs = vec![
             header::AUTHORIZATION,
             header::COOKIE,
@@ -217,7 +213,36 @@ impl Server {
             .layer(DecompressionLayer::new())
             .into_inner();
 
-        self.router.clone().layer(stack).into_make_service()
+        let mut axum_service = self.router.clone().layer(stack).into_make_service();
+
+        let conn_limit = Arc::new(Semaphore::new(self.settings.server_connection_limit));
+
+        let settings = self.settings.clone();
+        tower::ServiceBuilder::new()
+            .load_shed()
+            .layer(GlobalConcurrencyLimitLayer::with_semaphore(conn_limit))
+            .service_fn(move |stream: &AddrStream| {
+                crate::debug!(
+                    "New connection accepted: {}:{} -> {}:{}",
+                    stream.remote_addr().ip(),
+                    stream.remote_addr().port(),
+                    stream.local_addr().ip(),
+                    stream.local_addr().port()
+                )
+                .attr("peer_ip", stream.remote_addr().ip().to_string())
+                .attr("peer_port", stream.remote_addr().port());
+
+                let _res = (|| unsafe {
+                    let socket = socket2::Socket::from_raw_fd(stream.as_raw_fd());
+                    socket.set_nodelay(true)?;
+                    socket.set_thin_linear_timeouts(true)?;
+                    socket.set_linger(Some(settings.server_linger_timeout))?;
+
+                    Ok(()) as std::io::Result<()>
+                })();
+
+                axum_service.call(stream)
+            })
     }
 }
 
@@ -225,13 +250,13 @@ pub struct Shutdown(Arc<Notify>);
 
 impl Shutdown {
     pub fn shutdown(self) {
-        // TODO(observability): add a log for this.
         self.0.notify_waiters();
+        crate::info!("Shutdown notified for server tasks");
     }
 }
 
 crate::settings! {
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     pub(crate) ServerSettings {
         /// Port that the server should listen in.
         ///
