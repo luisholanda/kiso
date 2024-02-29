@@ -21,7 +21,6 @@ use tonic::server::NamedService;
 use tower::{limit::GlobalConcurrencyLimitLayer, Service};
 use tower_http::{
     compression::CompressionLayer,
-    decompression::DecompressionLayer,
     sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
 };
 
@@ -210,7 +209,6 @@ impl Server {
             .layer(SetSensitiveRequestHeadersLayer::new(req_sensitive_hdrs))
             .layer(SetSensitiveResponseHeadersLayer::new(res_sensitive_hdrs))
             .layer(CompressionLayer::new())
-            .layer(DecompressionLayer::new())
             .into_inner();
 
         let mut axum_service = self.router.clone().layer(stack).into_make_service();
