@@ -8,10 +8,14 @@ use std::{
     future::Future,
     process::Termination,
     sync::{atomic::AtomicU16, Arc},
+    time::Duration,
 };
 
 use clap::Parser as _;
 use once_cell::sync::Lazy;
+use tokio::task::JoinHandle;
+
+mod stall;
 
 crate::settings!(pub(crate) RuntimeSettings {
     /// The number of scheduler ticks before checking for external events.
@@ -26,7 +30,7 @@ crate::settings!(pub(crate) RuntimeSettings {
     /// If not set, the runtime will start in all the available CPUs.
     ///
     /// This is useful during development to reduce the load in the system.
-    runtime_single_cpu: bool,
+    runtime_single_cpu: bool = false,
     /// If we should pin some runtime threads to each CPU core.
     ///
     /// This reduces the number of CPU cache misses, by ensuring a task is always
@@ -42,15 +46,39 @@ crate::settings!(pub(crate) RuntimeSettings {
     ///
     /// Default to 512.
     runtime_thread_pool_size: usize = 512,
+    /// The budget tasks have to run a poll call.
+    ///
+    /// Any task that takes more than this duration to finish polling, will be
+    /// considered a stall.
+    ///
+    /// Defaults to 10ms.
+    #[arg(value_parser = crate::settings::DurationParser)]
+    runtime_stall_detection_budget: Duration = Duration::from_millis(10),
+    /// The max number of frames to capture from the stack position.
+    ///
+    /// Defaults to 512.
+    runtime_stall_detection_max_stall_backtrace_frames: usize = 1 << 10,
 });
 
-/// Blocks the execution on a future.
+/// Blocks the thread on the execution of a future.
 pub fn block_on<R: Termination>(fut: impl Future<Output = R>) -> R {
-    RUNTIME.block_on(fut)
+    // SAFETY: RUNTIME already takes care of initializing the stall detector.
+    RUNTIME.block_on(unsafe { self::stall::detect_stall_on_poll(fut) })
+}
+
+/// Spawns a future inside Kiso's runtime as a new task.
+pub fn spawn<F>(fut: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send,
+{
+    // SAFETY: RUNTIME already takes care of initializing the stall detector.
+    RUNTIME.spawn(unsafe { self::stall::detect_stall_on_poll(fut) })
 }
 
 static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
     let rt_settings = RuntimeSettings::parse();
+
     let mut builder = if rt_settings.runtime_single_cpu {
         tokio::runtime::Builder::new_current_thread()
     } else {
@@ -58,7 +86,9 @@ static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
     };
 
     if !rt_settings.runtime_single_cpu {
-        builder.on_thread_start(runtime_thread_start(&rt_settings));
+        builder
+            .on_thread_start(runtime_thread_start(&rt_settings))
+            .on_thread_stop(runtime_thread_stop(&rt_settings));
     }
 
     builder
@@ -80,6 +110,8 @@ fn runtime_thread_start(settings: &RuntimeSettings) -> impl Fn() + Send + Sync +
     let count = Arc::new(AtomicU16::new(0));
 
     let pin_threads = settings.runtime_pin_threads;
+    let stall_budget = settings.runtime_stall_detection_budget;
+    let stall_max_frames = settings.runtime_stall_detection_max_stall_backtrace_frames;
 
     move || {
         if pin_threads {
@@ -93,6 +125,20 @@ fn runtime_thread_start(settings: &RuntimeSettings) -> impl Fn() + Send + Sync +
 
                 let _ = nix::sched::sched_setaffinity(nix::unistd::getpid(), &cpuset);
             }
+        }
+
+        // SAFETY: the thread was just initialized, register was never called.
+        unsafe {
+            self::stall::LocalStallDetector::register(stall_budget, stall_max_frames);
+        }
+    }
+}
+
+fn runtime_thread_stop(_: &RuntimeSettings) -> impl Fn() + Send + Sync + 'static {
+    move || {
+        // SAFETY: register was called during thread start.
+        unsafe {
+            self::stall::LocalStallDetector::unregister();
         }
     }
 }

@@ -1,5 +1,6 @@
 use std::time::SystemTime;
 
+use backtrace::Backtrace;
 pub use opentelemetry::logs::Severity;
 use opentelemetry::{
     logs::{AnyValue, LogRecordBuilder},
@@ -16,6 +17,7 @@ pub fn log(level: Severity, body: AnyValue, loc: SourceLocation) -> LogBuilder {
             .with_severity_text(level.name())
             .with_body(body),
         location: loc,
+        backtrace: None,
     }
 }
 
@@ -29,6 +31,7 @@ pub struct LogBuilder {
     // store the location instead of settings the attributes directly to prevent allocating
     // the attribute vector in the common case where no attributes are set.
     location: SourceLocation,
+    backtrace: Option<Backtrace>,
 }
 
 // TODO(errors): add method for error attributes.
@@ -43,6 +46,18 @@ impl LogBuilder {
         V: Into<AnyValue>,
     {
         self.log = std::mem::take(&mut self.log).with_attribute(key, value);
+        self
+    }
+
+    /// Add a backtrace to the log.
+    ///
+    /// This allows a more precise information on where the log was made, but is more
+    /// expensive to get.
+    ///
+    /// Is recommended to pass an unresolved backtrace, as then the resolve process
+    /// can be made outside of the hot path.
+    pub fn backtrace(mut self, backtrace: Backtrace) -> Self {
+        self.backtrace = Some(backtrace);
         self
     }
 }

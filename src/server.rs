@@ -1,5 +1,6 @@
 use std::{
     convert::Infallible,
+    future::Future,
     net::{IpAddr, SocketAddr},
     os::fd::{AsRawFd, FromRawFd},
     sync::Arc,
@@ -138,6 +139,7 @@ impl Server {
                     .http2_only(self.grpc_enabled || self.settings.server_http2_only)
                     .http2_adaptive_window(self.settings.server_http2_adaptive_flow_control)
                     .http2_keep_alive_interval(Some(self.settings.server_http2_keep_alive_interval))
+                    .executor(KisoExecutor)
                     .serve(service.clone())
                     .with_graceful_shutdown(async move { notify.notified().await });
 
@@ -260,6 +262,19 @@ impl Shutdown {
     pub fn shutdown(self) {
         self.0.notify_waiters();
         crate::info!("Shutdown notified for server tasks");
+    }
+}
+
+#[derive(Clone)]
+struct KisoExecutor;
+
+impl<Fut> hyper::rt::Executor<Fut> for KisoExecutor
+where
+    Fut: Future + Send + 'static,
+    Fut::Output: Send,
+{
+    fn execute(&self, fut: Fut) {
+        crate::rt::spawn(fut);
     }
 }
 

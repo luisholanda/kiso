@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 axum = { version = "0.6.20", default-features = false }
+backtrace = "0.3.69"
 clap = { version = "4.4.18", features = ["derive"] }
 flume = "0.11.0"
 futures-util = "0.3.30"
@@ -21,13 +22,14 @@ opentelemetry_sdk = { version = "0.22.0", features = ["logs", "trace", "rt-tokio
 opentelemetry-semantic-conventions = "0.14.0"
 rustls = "0.22.0"
 rustls-native-certs = "0.7.0"
+signal-hook = "0.3.17"
 socket2 = { version = "0.5.5", features = ["all"] }
 tokio-rustls = "0.25.0"
 tonic-health = { version = "0.10.2", default-features = false }
 
 [dependencies.nix]
 version = "0.27.1"
-features = ["sched"]
+features = ["pthread", "sched", "time"]
 
 [dependencies.tokio]
 version = "1.36.0"
