@@ -70,7 +70,19 @@ impl Client {
 
 impl Default for Client {
     fn default() -> Self {
-        let settings: HttpsClientSettings = crate::settings::get();
+        Self::new(crate::settings::get())
+    }
+}
+
+impl Client {
+    /// Crete a new HTTPS client, using the provided settings.
+    ///
+    /// This is most useful when there is the need to change in specific ways the
+    /// configuration provided via command line, e.g. a specific host that doesn't
+    /// support HTTP/2, but the all others do.
+    ///
+    /// If this isn't needed, prever to use the default instance.
+    pub fn new(settings: HttpsClientSettings) -> Self {
         let default_timeout = settings.https_client_default_timeout;
 
         let client = hyper::Client::builder()
@@ -120,7 +132,7 @@ impl Default for Client {
                     Ok(resp)
                 }
             })
-            .service(client.clone());
+            .service(client);
 
         Self { inner }
     }
