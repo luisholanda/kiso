@@ -1,5 +1,5 @@
 use std::{
-    cell::Cell,
+    cell::RefCell,
     future::Future,
     marker::PhantomPinned,
     pin::Pin,
@@ -71,34 +71,22 @@ pub fn try_current<T: Context + Clone>() -> Option<T> {
 ///
 /// Panics if no value for the given type is set.
 pub fn with<T: Context, O>(f: impl FnOnce(&T) -> O) -> O {
-    let ptr = current_ptr::<T>();
+    let Some(val) = try_with(f) else {
+        panic!("no context value for type {}", std::any::type_name::<T>());
+    };
 
-    assert!(
-        !ptr.is_null(),
-        "no context value for type {}",
-        std::any::type_name::<T>()
-    );
-
-    f(unsafe { &*ptr })
+    val
 }
 
 /// Executes a function with a reference to the current value in the context stack.
 pub fn try_with<T: Context, O>(f: impl FnOnce(&T) -> O) -> Option<O> {
-    let ptr = current_ptr::<T>();
-
-    unsafe {
-        if ptr.is_null() {
-            None
-        } else {
-            Some(f(&*ptr))
-        }
-    }
+    T::cell().with_borrow(|s| s.as_ref().map(f))
 }
 
 /// Push a value into the context stack inside a function execution.
 #[allow(clippy::needless_pass_by_value)]
 pub fn scope_sync<T: Context, O>(value: T, func: impl FnOnce() -> O) -> O {
-    let _guard = StackGuard::new(&value as *const T);
+    let _guard = StackGuard::new(value);
     func()
 }
 
@@ -143,8 +131,8 @@ pub async fn scope<T: Context, O>(value: T, fut: impl Future<Output = O>) -> O {
 /// is ONLY used for the context machinery, and is not shared between different types.
 ///
 /// Not upholding this contract WILL cause memory corruption.
-pub unsafe trait Context: Sized {
-    fn cell() -> &'static LocalKey<Cell<*const ()>>;
+pub unsafe trait Context: Sized + 'static {
+    fn cell() -> &'static LocalKey<RefCell<Option<Self>>>;
 }
 
 #[macro_export]
@@ -167,9 +155,9 @@ macro_rules! impl_context_for_type {
 
     (noextension $ty: ty) => {
         unsafe impl $crate::context::Context for $ty {
-            fn cell() -> &'static ::std::thread::LocalKey<::std::cell::Cell<*const ()>> {
+            fn cell() -> &'static ::std::thread::LocalKey<::std::cell::RefCell<Option<Self>>> {
                 thread_local! {
-                    static STACK: ::std::cell::Cell<*const ()> = const { ::std::cell::Cell::new(::std::ptr::null()) };
+                    static STACK: ::std::cell::RefCell<Option<$ty>> = const { ::std::cell::RefCell::new(None) };
                 }
 
                 &STACK
@@ -178,57 +166,44 @@ macro_rules! impl_context_for_type {
     };
 }
 
-#[inline(always)]
-fn current_ptr<T: Context>() -> *const T {
-    T::cell().with(|s| s.get()) as *const T
-}
-
-struct StackGuard {
-    prev: *const (),
-    // Storing this pointer prevents us from having to be generic over the context
-    // and also from having to pass by the thread-local checks on drop.
-    cell: *mut *const (),
+struct StackGuard<T> {
+    cell: *mut Option<T>,
+    prev_item: Option<T>,
     _pinned: PhantomPinned,
 }
 
-impl StackGuard {
-    fn new<T: Context>(value: *const T) -> Self {
-        let (curr_item, cell) = T::cell().with(|c| {
-            let ptr = c.as_ptr();
-            (c.replace(value as *const ()), ptr)
+impl<T: Context> StackGuard<T> {
+    fn new(value: T) -> Self {
+        let (prev_item, cell) = T::cell().with_borrow_mut(|s| {
+            let prev = s.replace(value);
+            (prev, std::ptr::from_mut(s))
         });
 
         StackGuard {
-            prev: curr_item,
             cell,
+            prev_item,
             _pinned: PhantomPinned,
         }
     }
 }
 
-impl Drop for StackGuard {
+impl<T> Drop for StackGuard<T> {
     fn drop(&mut self) {
         // SAFETY: self.cell is valid as Context requires a thread-local static to the cell.
-        unsafe { std::ptr::write(self.cell, self.prev) };
+        unsafe { std::mem::swap(self.cell.as_mut().unwrap(), &mut self.prev_item) }
     }
 }
 
 struct AsyncStackGuard<F, U> {
     fut: F,
-    value: U,
-    cell: *mut *const U,
-    prev_item: *const U,
+    slot: Option<U>,
 }
 
 impl<F, U: Context> AsyncStackGuard<F, U> {
     fn new(value: U, fut: F) -> Self {
-        let (curr_item, cell) = U::cell().with(|s| (s.get(), s.as_ptr()));
-
         Self {
-            value,
+            slot: Some(value),
             fut,
-            cell: cell as *mut *const U,
-            prev_item: curr_item as *const U,
         }
     }
 }
@@ -236,6 +211,7 @@ impl<F, U: Context> AsyncStackGuard<F, U> {
 impl<F, U> Future for AsyncStackGuard<F, U>
 where
     F: Future,
+    U: Context,
 {
     type Output = F::Output;
 
@@ -243,14 +219,30 @@ where
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
+        struct Guard<'a, T> {
+            cell: *mut Option<T>,
+            prev_item: &'a mut Option<T>,
+            _pinned: PhantomPinned,
+        }
+
+        impl<T> Drop for Guard<'_, T> {
+            fn drop(&mut self) {
+                // SAFETY: self.cell is valid as Context requires a thread-local static to the cell.
+                unsafe { std::mem::swap(self.cell.as_mut().unwrap_unchecked(), self.prev_item) }
+            }
+        }
+
         unsafe {
             let this = self.get_unchecked_mut();
 
-            std::ptr::write(this.cell, std::ptr::from_ref(&this.value));
+            let cell = U::cell().with_borrow_mut(|s| {
+                std::mem::swap(s, &mut this.slot);
+                std::ptr::from_mut(s)
+            });
 
-            let _guard = StackGuard {
-                prev: this.prev_item as *const (),
-                cell: this.cell as *mut *const (),
+            let _guard = Guard {
+                prev_item: &mut this.slot,
+                cell,
                 _pinned: PhantomPinned,
             };
 
