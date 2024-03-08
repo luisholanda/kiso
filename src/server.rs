@@ -9,7 +9,9 @@ use std::{
 
 use axum::response::IntoResponse;
 use clap::builder::TypedValueParser;
+use http_body::combinators::UnsyncBoxBody;
 use hyper::{
+    body::Bytes,
     header,
     server::conn::{AddrIncoming, AddrStream},
     Body, Request, Response,
@@ -22,17 +24,23 @@ use tonic::server::NamedService;
 use tower::{limit::GlobalConcurrencyLimitLayer, Service};
 use tower_http::{
     compression::CompressionLayer,
+    decompression::DecompressionBody,
     sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
 };
+
+use self::grpc::ServiceConfiguration;
+use crate::server::grpc::GrpcService;
+
+mod grpc;
 
 /// A gRPC/HTTP server, preconfigured for production workloads.
 ///
 /// Automatically configures the following features:
 ///
 /// - Connection limit and load sheding.
-/// - Accept compressed bodies.
+/// - Accept compressed bodies (TODO for HTTP).
 /// - Returns compressed bodies.
-/// - Health checking service and HTTP route (TODO).
+/// - Health checking service and HTTP route.
 /// - Optimized HTTP/2 and socket configuration.
 /// - Graceful shutdown support.
 /// - Multiple acceptors for better connection stablishment latency.
@@ -41,6 +49,7 @@ use tower_http::{
 pub struct Server {
     router: axum::Router,
     settings: ServerSettings,
+    grpc_settings: GrpcServiceSettings,
     grpc_enabled: bool,
 }
 
@@ -49,6 +58,7 @@ impl Default for Server {
         Self {
             router: axum::Router::new(),
             settings: crate::settings::get(),
+            grpc_settings: crate::settings::get(),
             grpc_enabled: false,
         }
     }
@@ -77,8 +87,11 @@ impl Server {
     where
         S: Clone
             + NamedService
-            + Service<Request<Body>, Error = Infallible>
-            + Send
+            + Service<
+                Request<DecompressionBody<Body>>,
+                Response = Response<UnsyncBoxBody<Bytes, tonic::Status>>,
+                Error = Infallible,
+            > + Send
             + Sync
             + 'static,
         S::Response: IntoResponse,
@@ -86,10 +99,13 @@ impl Server {
     {
         crate::debug!("Mounting gRPC service {}", S::NAME);
 
+        let srv_config = self.get_service_config(S::NAME);
+
         self.grpc_enabled = true;
-        // TODO(grpc): add gRPC default middleware stack.
-        self.router = std::mem::take(&mut self.router)
-            .route_service(&format!("/{}/:method", S::NAME), service);
+        self.router = std::mem::take(&mut self.router).route_service(
+            &format!("/{}/:method", S::NAME),
+            GrpcService::new(service, srv_config),
+        );
         self
     }
 
@@ -143,8 +159,11 @@ impl Server {
                     .serve(service.clone())
                     .with_graceful_shutdown(async move { notify.notified().await });
 
-                // TODO(observability): add log for error.
-                tokio::spawn(server);
+                tokio::spawn(async move {
+                    if let Err(err) = server.await {
+                        crate::error!("Server killed unexpectedly: {err}");
+                    }
+                });
             });
         }
 
@@ -254,6 +273,34 @@ impl Server {
                 axum_service.call(stream)
             })
     }
+
+    fn get_service_config(&self, service: &str) -> ServiceConfiguration {
+        let mut config = ServiceConfiguration {
+            default_deadline: self.grpc_settings.grpc_default_deadline,
+            body_limit: self.grpc_settings.grpc_default_body_limit,
+            request_concurrency_limit: self.grpc_settings.grpc_default_concurrency,
+        };
+
+        for (srv, dur) in &self.grpc_settings.grpc_service_deadline {
+            if service == srv {
+                config.default_deadline = *dur;
+            }
+        }
+
+        for (srv, limit) in &self.grpc_settings.grpc_service_body_limit {
+            if service == srv {
+                config.body_limit = *limit;
+            }
+        }
+
+        for (srv, limit) in &self.grpc_settings.grpc_service_concurrency {
+            if service == srv {
+                config.request_concurrency_limit = *limit;
+            }
+        }
+
+        config
+    }
 }
 
 pub struct Shutdown(Arc<Notify>);
@@ -301,7 +348,7 @@ crate::settings! {
         ///
         /// Defaults to no limit.
         server_connection_limit: usize = usize::MAX,
-        /// Timeout for queued messed to be sent when the server is shutdown.
+        /// Timeout for queued messages to be sent when the server is shutdown.
         ///
         /// Defaults to 5s.
         #[arg(value_parser = crate::settings::DurationParser)]
@@ -332,5 +379,49 @@ crate::settings! {
         ///
         /// "Set-Cookie" is already marked as sensitive.
         server_extra_response_sensitive_headers: Vec<String>,
+    }
+}
+
+crate::settings! {
+    pub(crate) GrpcServiceSettings {
+        /// The default deadline for gRPC services.
+        ///
+        /// Defaults to 30 seconds.
+        ///
+        /// This can be overwritten per-service using `grpc-service-deadline`.
+        #[arg(value_parser = crate::settings::DurationParser)]
+        grpc_default_deadline: Duration = Duration::from_secs(30),
+        /// The default body limit for gRPC services.
+        ///
+        /// Defaults to 30Kib.
+        ///
+        /// This can be overwritten per-service using `grpc-service-body-limit`.
+        #[arg(value_parser = crate::settings::SizeParser)]
+        grpc_default_body_limit: usize = 30 * 1024,
+        /// The default maximum number of inflight requests that each service supports.
+        ///
+        /// Defaults to no limit.
+        ///
+        /// This can be overwritten per-service using `grpc-service-concurrency`.
+        ///
+        /// # Note
+        ///
+        /// Currently, when this limit is reached, any further requests are cancelled.
+        grpc_default_concurrency: u32 = u32::MAX,
+        /// The deadline for individual gRPC services.
+        ///
+        /// This should be `<service name>=<deadline>`.
+        #[arg(value_parser = crate::settings::KeyValueParser::<crate::settings::DurationParser>::default())]
+        grpc_service_deadline: Vec<(String, Duration)>,
+        /// The request body limit for individual gRPC services.
+        ///
+        /// This should be `<service name>=<limit>`.
+        #[arg(long, value_parser = crate::settings::KeyValueParser::<crate::settings::SizeParser>::default())]
+        grpc_service_body_limit: Vec<(String, usize)>,
+        /// The concurrency limit for in-flight requests for individual gRPC services.
+        ///
+        /// This should be `<service name>=<concurrency>`.
+        #[arg(long, value_parser = crate::settings::KeyValueParser::<clap::builder::RangedI64ValueParser<u32>>::default())]
+        grpc_service_concurrency: Vec<(String, u32)>,
     }
 }
