@@ -1,7 +1,7 @@
-use std::{borrow::Cow, time::SystemTime};
+use std::{borrow::Cow, str::FromStr, time::SystemTime};
 
 use opentelemetry::{
-    trace::{Link, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceState},
+    trace::{Link, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState},
     Key, KeyValue, Value,
 };
 use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
@@ -9,20 +9,31 @@ use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
 use super::worker::{Command, LightSpanCtx};
 
 /// A started span inside a trace.
-#[derive(Clone)]
 pub struct Span {
+    end_on_drop: bool,
     ctx: SpanContext,
 }
 
 crate::impl_context_for_type!(Span);
 
 impl Span {
-    /// Starts the construction of a root span.
-    pub fn root(name: impl Into<Cow<'static, str>>, kind: SpanKind) -> SpanBuilder {
+    /// Starts the construction of a new span.
+    pub fn builder(name: impl Into<Cow<'static, str>>, kind: SpanKind) -> SpanBuilder {
         let id_gen = RandomIdGenerator::default();
 
-        SpanBuilder {
-            span_context: SpanContext::new(
+        let (span_ctx, parent_id) = crate::context::try_with::<Span, _>(|parent| {
+            let ctx = SpanContext::new(
+                parent.ctx.trace_id(),
+                id_gen.new_span_id(),
+                parent.ctx.trace_flags(),
+                false,
+                parent.ctx.trace_state().clone(),
+            );
+
+            (ctx, parent.ctx.span_id())
+        })
+        .unwrap_or_else(|| {
+            let ctx = SpanContext::new(
                 id_gen.new_trace_id(),
                 id_gen.new_span_id(),
                 // TODO: think in how to use otel-sdk's ShouldSample here.
@@ -30,10 +41,16 @@ impl Span {
                 // These values makes sense as this is a root span.
                 false,
                 TraceState::default(),
-            ),
+            );
+
+            (ctx, SpanId::INVALID)
+        });
+
+        SpanBuilder {
+            span_context: span_ctx,
             name: name.into(),
             kind,
-            parent_id: SpanId::INVALID,
+            parent_id,
             attributes: Vec::with_capacity(8),
         }
     }
@@ -86,6 +103,23 @@ impl Span {
     }
 }
 
+impl Clone for Span {
+    fn clone(&self) -> Self {
+        Self {
+            end_on_drop: false,
+            ctx: self.ctx.clone(),
+        }
+    }
+}
+
+impl Drop for Span {
+    fn drop(&mut self) {
+        if self.end_on_drop {
+            super::send_cmd(Command::EndSpan(self.light_id(), SystemTime::now()));
+        }
+    }
+}
+
 pub struct SpanBuilder {
     pub(super) span_context: SpanContext,
     pub(super) name: Cow<'static, str>,
@@ -105,6 +139,12 @@ impl SpanBuilder {
         self
     }
 
+    /// Change the name of the span, before starting it.
+    pub fn set_name(mut self, new_name: impl Into<Cow<'static, str>>) -> Self {
+        self.name = new_name.into();
+        self
+    }
+
     /// Start the span.
     pub fn start(self) -> Span {
         super::send_cmd(Command::NewSpan(NewSpan {
@@ -117,7 +157,63 @@ impl SpanBuilder {
         }));
 
         Span {
+            end_on_drop: true,
             ctx: self.span_context,
+        }
+    }
+
+    /// Set the span parent from the given W3C trace headers.
+    ///
+    /// Returns `None` if the `traceparent` header is invalid.
+    pub fn with_w3c_parent(mut self, traceparent: &str, tracestate: Option<&str>) -> Option<Self> {
+        let mut parts = traceparent.split_terminator('-');
+
+        let version = u8::from_str_radix(parts.next()?, 16).ok()?;
+        if version == u8::MAX {
+            return None;
+        }
+
+        let trace_id_hex = parts.next()?;
+        if trace_id_hex.chars().any(|c| c.is_ascii_uppercase()) {
+            return None;
+        }
+
+        let trace_id = TraceId::from_hex(trace_id_hex).ok()?;
+
+        let span_id_hex = parts.next()?;
+        if span_id_hex.chars().any(|c| c.is_ascii_uppercase()) {
+            return None;
+        }
+
+        let span_id = SpanId::from_hex(span_id_hex).ok()?;
+
+        let opts = u8::from_str_radix(parts.next()?, 16).ok()?;
+
+        let trace_flags = TraceFlags::new(opts) & TraceFlags::SAMPLED;
+
+        let tracestate = tracestate
+            .and_then(|s| TraceState::from_str(s).ok())
+            .unwrap_or_default();
+
+        if parts.next().is_some() {
+            return None;
+        }
+
+        let ctx = SpanContext::new(
+            trace_id,
+            RandomIdGenerator::default().new_span_id(),
+            trace_flags,
+            false,
+            tracestate,
+        );
+
+        if ctx.is_valid() {
+            self.span_context = ctx;
+            self.parent_id = span_id;
+
+            Some(self)
+        } else {
+            None
         }
     }
 }

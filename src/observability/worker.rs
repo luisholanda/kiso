@@ -1,4 +1,8 @@
-use std::{borrow::Cow, collections::HashMap, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    time::{Duration, SystemTime},
+};
 
 use flume::{Receiver, Sender};
 use opentelemetry::{
@@ -28,6 +32,7 @@ pub(super) enum Command {
     SetSpanStatus(LightSpanCtx, Status),
     UpdateSpanName(LightSpanCtx, Cow<'static, str>),
     AddLinkToSpan(LightSpanCtx, Link),
+    EndSpan(LightSpanCtx, SystemTime),
 }
 
 impl Command {
@@ -39,7 +44,7 @@ impl Command {
                     ..
                 },
                 _,
-            ) => *n >= Severity::Warn,
+            ) => *n >= Severity::Info,
             _ => true,
         }
     }
@@ -148,6 +153,12 @@ impl Worker {
             Command::AddLinkToSpan(span_ctx, link) => {
                 if let Some(span) = self.spans.get_mut(&span_ctx) {
                     span.links.links.push(link);
+                }
+            }
+            Command::EndSpan(span_ctx, end_ts) => {
+                if let Some(span) = self.spans.get_mut(&span_ctx) {
+                    span.end_time = end_ts;
+                    // TODO: dispatch to span processor.
                 }
             }
         }
