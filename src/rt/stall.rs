@@ -2,7 +2,10 @@ use std::{
     cell::Cell,
     future::Future,
     mem::MaybeUninit,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -29,7 +32,7 @@ where
     F: FnOnce() -> O,
 {
     let guard = StallGuard {
-        detector: LocalStallDetector::INSTANCE.with(|d| unsafe { (*d.as_ptr()).assume_init_ref() }),
+        detector: LocalStallDetector::instance(),
         start: Instant::now(),
     };
 
@@ -72,6 +75,7 @@ pub(super) struct LocalStallDetector {
     stall_timeout: Duration,
     rx: Receiver<Frame>,
     armed: Cell<bool>,
+    detections_count: Arc<AtomicU64>,
 }
 
 impl Drop for LocalStallDetector {
@@ -93,6 +97,10 @@ impl Drop for LocalStallDetector {
 impl LocalStallDetector {
     thread_local! {
         static INSTANCE: Cell<MaybeUninit<LocalStallDetector>> = const { Cell::new(MaybeUninit::uninit()) };
+    }
+
+    unsafe fn instance() -> &'static Self {
+        Self::INSTANCE.with(|d| unsafe { (*d.as_ptr()).assume_init_ref() })
     }
 
     /// Register the stall detector for the current execution thread.
@@ -123,6 +131,7 @@ impl LocalStallDetector {
             stall_timeout,
             rx,
             armed: Cell::new(false),
+            detections_count: Arc::default(),
         }))
     }
 
@@ -203,6 +212,10 @@ impl Drop for StallGuard {
             return;
         }
 
+        self.detector
+            .detections_count
+            .fetch_add(1, Ordering::Release);
+
         let elapsed = self.start.elapsed();
         let overage = elapsed.saturating_sub(self.detector.stall_timeout);
 
@@ -213,5 +226,47 @@ impl Drop for StallGuard {
             overage.as_micros()
         )
         .backtrace(strace);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_not_detect_stall() {
+        let detections = unsafe {
+            LocalStallDetector::register(Duration::from_millis(100), 128);
+
+            detect_stall(|| {
+                std::thread::sleep(Duration::from_millis(20));
+            });
+
+            LocalStallDetector::instance()
+                .detections_count
+                .load(Ordering::Acquire)
+        };
+
+        assert_eq!(detections, 0, "erroneous detected stall");
+    }
+
+    #[test]
+    fn should_detect_stall() {
+        let detections = unsafe {
+            LocalStallDetector::register(Duration::from_millis(100), 128);
+
+            detect_stall(|| {
+                std::thread::sleep(Duration::from_millis(120));
+            });
+
+            LocalStallDetector::instance()
+                .detections_count
+                .load(Ordering::Acquire)
+        };
+
+        assert_eq!(
+            detections, 1,
+            "did not detect stall or detected more than was expected"
+        );
     }
 }
