@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use backtrace::Backtrace;
 use flume::{Receiver, Sender};
 use opentelemetry::{
     logs::{LogRecord, Severity},
@@ -24,7 +25,7 @@ use super::{logging::SourceLocation, tracing::NewSpan};
 
 pub(super) enum Command {
     // Logging
-    EmitLog(LogRecord, SourceLocation),
+    EmitLog(LogRecord, SourceLocation, Option<Backtrace>),
 
     // Tracing
     NewSpan(NewSpan),
@@ -44,6 +45,7 @@ impl Command {
                     ..
                 },
                 _,
+                _,
             ) => *n >= Severity::Info,
             _ => true,
         }
@@ -55,6 +57,7 @@ pub(super) type LightSpanCtx = (TraceId, SpanId);
 pub(super) struct Worker {
     rx: Receiver<Command>,
     log_processor: BatchLogProcessor<Tokio>,
+    log_backtrace_printer: Box<dyn Fn(Backtrace) -> String>,
     resource: &'static Resource,
     library: InstrumentationLibrary,
     spans: HashMap<LightSpanCtx, SpanData>,
@@ -62,6 +65,7 @@ pub(super) struct Worker {
 
 pub(super) struct WorkerConfig {
     pub(super) log_processor: BatchLogProcessor<Tokio>,
+    pub(super) log_backtrace_printer: Box<dyn Fn(Backtrace) -> String + Send>,
     pub(super) cmd_channel_capacity: usize,
     pub(super) resource_detection_timeout: Duration,
     pub(super) initial_spans_capacity: usize,
@@ -83,6 +87,7 @@ impl Worker {
             let mut worker = Worker {
                 rx,
                 log_processor: config.log_processor,
+                log_backtrace_printer: config.log_backtrace_printer,
                 resource,
                 library: instrumentation_library,
                 spans: HashMap::with_capacity(config.initial_spans_capacity),
@@ -98,7 +103,7 @@ impl Worker {
 
     fn handle_command(&mut self, cmd: Command) {
         match cmd {
-            Command::EmitLog(mut log, loc) => {
+            Command::EmitLog(mut log, loc, bt) => {
                 log.attributes
                     .get_or_insert_with(|| Vec::with_capacity(8))
                     .extend([
@@ -108,6 +113,16 @@ impl Worker {
                         (trace::CODE_FUNCTION.into(), loc.function.into()),
                         (trace::CODE_NAMESPACE.into(), loc.module.into()),
                     ]);
+
+                if let Some(mut bt) = bt {
+                    bt.resolve();
+                    let bt = (self.log_backtrace_printer)(bt);
+                    log.attributes
+                        .as_mut()
+                        .unwrap()
+                        .push((trace::EXCEPTION_STACKTRACE.into(), bt.into()));
+                }
+
                 self.log_processor.emit(LogData {
                     record: log,
                     resource: Cow::Borrowed(self.resource),

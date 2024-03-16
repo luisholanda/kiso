@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use backtrace::Backtrace;
 use flume::{Sender, TrySendError};
 use once_cell::sync::OnceCell;
 use opentelemetry_sdk::{
@@ -16,7 +17,8 @@ pub mod tracing;
 mod worker;
 
 pub struct Exporters<L> {
-    log_exporter: L,
+    pub log_exporter: L,
+    pub log_backtrace_printer: Box<dyn Fn(Backtrace) -> String + Send>,
 }
 
 /// Initializes kiso's observability stack.
@@ -43,6 +45,7 @@ where
         log_processor: BatchLogProcessor::builder(exporters.log_exporter, Tokio)
             .with_batch_config(log_processor_config)
             .build(),
+        log_backtrace_printer: exporters.log_backtrace_printer,
         cmd_channel_capacity: settings.observability_buffer_capacity,
         resource_detection_timeout: settings.observability_resource_detection_timeout,
         initial_spans_capacity: settings.observability_tracing_initial_spans_buffer_size,

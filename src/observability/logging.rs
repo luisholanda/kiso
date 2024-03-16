@@ -69,6 +69,7 @@ impl Drop for LogBuilder {
         super::send_cmd(super::worker::Command::EmitLog(
             record,
             std::mem::take(&mut self.location),
+            self.backtrace.take(),
         ));
     }
 }
