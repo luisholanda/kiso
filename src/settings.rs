@@ -97,7 +97,8 @@ impl SettingsBuilder {
         self = self
             .register::<crate::clients::HttpsClientSettings>()
             .register::<crate::server::ServerSettings>()
-            .register::<crate::clients::GrpcChannelSettings>();
+            .register::<crate::clients::GrpcChannelSettings>()
+            .register::<crate::observability::ObservabilitySettings>();
 
         let settings = Settings {
             cmdline_matches: self.cmd.get_matches(),

@@ -53,7 +53,7 @@ where
         .expect("observability stack cannot be initialized more than once");
 }
 
-crate::settings!(ObservabilitySettings {
+crate::settings!(pub(crate) ObservabilitySettings {
     /// The capacity for the buffer used to send observability data to the background worker.
     ///
     /// This is in numbers of commands that the buffer can hold.
