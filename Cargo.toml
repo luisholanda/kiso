@@ -28,7 +28,7 @@ serde_json = "1.0.114"
 signal-hook = "0.3.17"
 socket2 = { version = "0.5.5", features = ["all"] }
 tokio-rustls = "0.25.0"
-tonic-health = { version = "0.10.2", default-features = false }
+tonic-health = { version = "0.11.0", default-features = false }
 
 [dependencies.nix]
 version = "0.27.1"
@@ -40,9 +40,9 @@ default-features = false
 features = ["full"]
 
 [dependencies.tonic]
-version = "0.10.2"
+version = "0.11.0"
 default-features = false
-features = ["codegen", "prost", "gzip"]
+features = ["codegen", "prost", "gzip", "zstd", "transport", "tls-roots"]
 
 [dependencies.tower]
 version = "0.4.13"

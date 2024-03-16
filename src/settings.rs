@@ -96,7 +96,8 @@ impl SettingsBuilder {
     pub fn install_from_args(mut self) {
         self = self
             .register::<crate::clients::HttpsClientSettings>()
-            .register::<crate::server::ServerSettings>();
+            .register::<crate::server::ServerSettings>()
+            .register::<crate::clients::GrpcChannelSettings>();
 
         let settings = Settings {
             cmdline_matches: self.cmd.get_matches(),

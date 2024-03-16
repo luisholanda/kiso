@@ -1,3 +1,8 @@
+mod grpc;
 mod https;
 
-pub use self::https::{Client as HttpsClient, HttpsClientSettings};
+#[doc(inline)]
+pub use self::{
+    grpc::{GrpcChannel, GrpcChannelSettings},
+    https::{Client as HttpsClient, HttpsClientSettings},
+};
