@@ -62,20 +62,32 @@ crate::settings!(ObservabilitySettings {
     /// logs.
     observability_buffer_capacity: usize = 128 * 1024 / std::mem::size_of::<Command>(),
     /// Timeout for the background worker to detect all the resource information.
+    ///
     /// Defaults to 5s.
     #[arg(value_parser = crate::settings::DurationParser)]
     observability_resource_detection_timeout: Duration = Duration::from_secs(5),
+    /// The maximum logs waiting to be processed. New logs will be dropped if the batch
+    /// is full and `observability_logging_batch_scheduled_delay` has not yet passed.
     ///
+    /// Defaults to 2048.
     observability_logging_batch_max_queue_size: usize = 2048,
+    /// Interval between processing consecutive log batches.
     ///
+    /// Defaults to 1s.
     #[arg(value_parser = crate::settings::DurationParser)]
     observability_logging_batch_scheduled_delay: Duration = Duration::from_secs(1),
+    /// Timeout for the export of a single logs batch.
     ///
+    /// Defaults to 30s.
     #[arg(value_parser = crate::settings::DurationParser)]
     observability_logging_batch_max_export_timeout: Duration = Duration::from_secs(30),
+    /// Size of a single logs batch.
     ///
+    /// Defaults to 512.
     observability_logging_batch_max_export_batch_size: usize = 512,
+    /// Initial capacity for the spans' data index.
     ///
+    /// Defaults to 2048.
     observability_tracing_initial_spans_buffer_size: usize = 2048,
 });
 

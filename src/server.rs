@@ -43,7 +43,7 @@ mod grpc;
 /// - Health checking service and HTTP route.
 /// - Optimized HTTP/2 and socket configuration.
 /// - Graceful shutdown support.
-/// - Multiple acceptors for better connection stablishment latency.
+/// - Multiple acceptors for better connection establishment latency.
 /// - Mark certain request and response headers as sensitive.
 /// - Observability traces and metrics (TODO).
 pub struct Server {

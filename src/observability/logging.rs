@@ -55,7 +55,7 @@ impl LogBuilder {
     /// expensive to get.
     ///
     /// Is recommended to pass an unresolved backtrace, as then the resolve process
-    /// can be made outside of the hot path.
+    /// can be made outside the hot path.
     pub fn backtrace(mut self, backtrace: Backtrace) -> Self {
         self.backtrace = Some(backtrace);
         self
