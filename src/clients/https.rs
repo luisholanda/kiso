@@ -1,17 +1,21 @@
 use std::{
     error::Error,
+    future::Future,
     net::SocketAddr,
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use axum::{
     body::{BoxBody, HttpBody},
-    http::header,
+    http::{header, HeaderMap, HeaderValue},
 };
 use bytes::{Buf, BufMut, BytesMut};
 use futures_util::future::BoxFuture;
 use hickory_resolver::{error::ResolveError, lookup_ip::LookupIp, TokioAsyncResolver};
+use http_body::SizeHint;
 use hyper::{
     body::Bytes,
     client::{
@@ -21,19 +25,23 @@ use hyper::{
     Body, Request, Response, StatusCode, Uri,
 };
 use once_cell::sync::Lazy;
+use opentelemetry::trace::{SpanKind, Status, TraceFlags};
+use opentelemetry_semantic_conventions::trace;
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
 };
 use tokio_rustls::{client::TlsStream, TlsConnector};
-use tower::{util::BoxCloneService, ServiceExt};
+use tower::{util::BoxCloneService, Service, ServiceExt};
 use tower_http::{
     decompression::{DecompressionBody, DecompressionLayer},
     sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
 };
 
-use crate::context::Deadline;
+use crate::{context::Deadline, observability::tracing::Span};
+
+pub type ClientBody = DecompressionBody<TracedBody<Body>>;
 
 /// An HTTPS client.
 ///
@@ -42,28 +50,26 @@ use crate::context::Deadline;
 /// like deadlines.
 #[derive(Clone)]
 pub struct Client {
-    inner: BoxCloneService<Request<BoxBody>, Response<DecompressionBody<Body>>, hyper::Error>,
+    inner: BoxCloneService<Request<BoxBody>, Response<ClientBody>, hyper::Error>,
 }
 
 impl Client {
-    /// Sends a HTTP request to the network.
+    /// Sends an HTTP request to the network.
     ///
     /// # Errors
     ///
     /// Fails if the internal client fails. No status code processing is made.
-    pub async fn request<B>(&self, request: Request<B>) -> Result<Response<BoxBody>, hyper::Error>
+    pub async fn request<B>(
+        &self,
+        request: Request<B>,
+    ) -> Result<Response<ClientBody>, hyper::Error>
     where
         B: HttpBody<Data = Bytes> + Send + 'static,
-        B::Error: std::error::Error + Send + Sync + 'static,
+        B::Error: Error + Send + Sync + 'static,
     {
         let req = request.map(|b| b.map_err(axum::Error::new).boxed_unsync());
 
-        let res = self
-            .inner
-            .clone()
-            .oneshot(req)
-            .await?
-            .map(|b| b.map_err(axum::Error::new).boxed_unsync());
+        let res = self.inner.clone().oneshot(req).await?;
 
         Ok(res)
     }
@@ -105,11 +111,11 @@ impl Client {
     async fn do_json_api_request(
         &self,
         mut req: Request<BoxBody>,
-    ) -> Result<Response<DecompressionBody<Body>>, JsonApiError> {
-        if !req.headers().contains_key(hyper::header::CONTENT_TYPE) {
+    ) -> Result<Response<ClientBody>, JsonApiError> {
+        if !req.headers().contains_key(header::CONTENT_TYPE) {
             req.headers_mut().append(
-                hyper::header::CONTENT_TYPE,
-                hyper::header::HeaderValue::from_static("application/json"),
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
             );
         }
 
@@ -135,9 +141,9 @@ impl Client {
 /// Errors that may happen with a call to [`Client::json_api_request`].
 pub enum JsonApiError {
     /// The response failed with a status code of class 4XX.
-    Client(Response<DecompressionBody<Body>>),
+    Client(Response<ClientBody>),
     /// The response failed with a status code of class 5XX.
-    Server(Response<DecompressionBody<Body>>),
+    Server(Response<ClientBody>),
     /// The request failed to be sent.
     Response(hyper::Error),
     /// The request body failed to be serialized.
@@ -197,6 +203,8 @@ impl Client {
             .layer(SetSensitiveRequestHeadersLayer::new(req_sensitive_hdrs))
             .layer(SetSensitiveResponseHeadersLayer::new(res_sensitive_hdrs))
             .layer(DecompressionLayer::new())
+            .map_response(|res: Response<Body>| res.map(TracedBody::new))
+            .layer_fn(|inner| TracingService { inner })
             .map_future(move |fut: ResponseFuture| async move {
                 let instant = if let Some(deadline) = crate::context::try_current::<Deadline>() {
                     deadline.instant()
@@ -325,16 +333,13 @@ impl HttpsConnector {
     }
 }
 
-impl tower::Service<Uri> for HttpsConnector {
+impl Service<Uri> for HttpsConnector {
     type Response = TlsConnection;
     type Error = ResolveError;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: Uri) -> Self::Future {
@@ -365,34 +370,230 @@ impl Connection for TlsConnection {
 
 impl AsyncRead for TlsConnection {
     fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+    ) -> Poll<std::io::Result<()>> {
         std::pin::pin!(&mut self.get_mut().inner).poll_read(cx, buf)
     }
 }
 
 impl AsyncWrite for TlsConnection {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+    ) -> Poll<Result<usize, std::io::Error>> {
         std::pin::pin!(&mut self.get_mut().inner).poll_write(cx, buf)
     }
 
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         std::pin::pin!(&mut self.get_mut().inner).poll_flush(cx)
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
         std::pin::pin!(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+#[derive(Clone)]
+struct TracingService<S> {
+    inner: S,
+}
+
+impl<S, B1, B2> Service<Request<B1>> for TracingService<S>
+where
+    S: Service<Request<B1>, Response = Response<B2>>,
+    S::Future: Future<Output = Result<Response<B2>, S::Error>> + Send + 'static,
+    S::Error: std::fmt::Display + 'static,
+    B2: 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: Request<B1>) -> Self::Future {
+        let mut builder = Span::builder(req.method().to_string(), SpanKind::Client);
+
+        builder = builder
+            .attr(trace::HTTP_REQUEST_METHOD, req.method().to_string())
+            .attr(trace::URL_FULL, req.uri().to_string());
+
+        if let Some(h) = req.uri().host() {
+            builder = builder.attr(trace::SERVER_ADDRESS, h.to_string());
+        }
+
+        'port: {
+            let p = if let Some(p) = req.uri().port_u16() {
+                p as i64
+            } else if req.uri().scheme_str() == Some("https") {
+                443
+            } else {
+                break 'port;
+            };
+
+            builder = builder.attr(trace::SERVER_PORT, p);
+        }
+
+        for (h, v) in req.headers() {
+            if v.is_sensitive() {
+                continue;
+            }
+
+            if let Ok(v) = v.to_str() {
+                builder = builder.attr(format!("http.request.header.{h}"), v.to_string());
+            }
+        }
+
+        let span = builder.start();
+
+        if let Ok(tracestate) = HeaderValue::from_str(&span.span_context().trace_state().header()) {
+            req.headers_mut().insert("tracestate", tracestate);
+        }
+
+        let traceparent = format!(
+            "00-{}-{}-{:02x}",
+            span.span_context().trace_id(),
+            span.span_context().span_id(),
+            span.span_context().trace_flags() & TraceFlags::SAMPLED
+        );
+
+        if let Ok(traceparent) = HeaderValue::from_str(&traceparent) {
+            req.headers_mut().insert("traceparent", traceparent);
+        }
+
+        let fut = crate::context::scope_sync(span.clone(), || self.inner.call(req));
+
+        Box::pin(crate::context::scope(span, async move {
+            let span = crate::context::current::<Span>();
+
+            let res = match fut.await {
+                Ok(res) => res,
+                Err(err) => {
+                    span.set_status(Status::error(err.to_string()));
+                    return Err(err);
+                }
+            };
+
+            if res.status().is_client_error() || res.status().is_server_error() {
+                // we can't get any meaningful description without reading the body.
+                span.set_status(Status::error(""));
+            }
+
+            span.set_attribute(
+                trace::HTTP_RESPONSE_STATUS_CODE,
+                res.status().as_u16() as i64,
+            );
+
+            for (h, v) in res.headers() {
+                if v.is_sensitive() {
+                    continue;
+                }
+
+                if let Ok(v) = v.to_str() {
+                    span.set_attribute(format!("http.response.header.{h}"), v.to_string());
+                }
+            }
+
+            Ok(res)
+        }))
+    }
+}
+
+/// A [`HttpBody`] that adds a span for the duration of a body reading.
+pub struct TracedBody<B> {
+    body: B,
+    span: Span,
+    data_frames: u64,
+    body_size: u64,
+}
+
+impl<B> TracedBody<B> {
+    pub fn new(body: B) -> Self {
+        Self {
+            body,
+            span: Span::builder("recv HTTP response body", SpanKind::Client).start(),
+            data_frames: 0,
+            body_size: 0,
+        }
+    }
+}
+
+impl<B: HttpBody> HttpBody for TracedBody<B>
+where
+    B::Error: std::fmt::Display,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_data(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        match unsafe { std::task::ready!(Pin::new_unchecked(&mut this.body).poll_data(cx)) } {
+            None => Poll::Ready(None),
+            Some(Ok(data_frame)) => {
+                this.data_frames += 1;
+                this.body_size += data_frame.remaining() as u64;
+
+                Poll::Ready(Some(Ok(data_frame)))
+            }
+            Some(Err(err)) => {
+                this.span.set_status(Status::error(err.to_string()));
+
+                Poll::Ready(Some(Err(err)))
+            }
+        }
+    }
+
+    fn poll_trailers(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<HeaderMap>, Self::Error>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        match unsafe { std::task::ready!(Pin::new_unchecked(&mut this.body).poll_trailers(cx)) } {
+            Ok(trailers) => {
+                if let Some(t) = &trailers {
+                    for (h, v) in t {
+                        if v.is_sensitive() {
+                            continue;
+                        }
+
+                        if let Ok(v) = v.to_str() {
+                            this.span
+                                .set_attribute(format!("http.response.trailer.{h}"), v.to_string());
+                        }
+                    }
+                }
+
+                this.span
+                    .set_attribute(trace::HTTP_RESPONSE_BODY_SIZE, this.body_size as i64);
+                this.span
+                    .set_attribute("http.response.body.data_frames", this.data_frames as i64);
+
+                Poll::Ready(Ok(trailers))
+            }
+            Err(err) => {
+                this.span.set_status(Status::error(err.to_string()));
+
+                Poll::Ready(Err(err))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
     }
 }
