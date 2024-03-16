@@ -1,4 +1,5 @@
 use std::{
+    error::Error,
     net::SocketAddr,
     sync::Arc,
     time::{Duration, Instant},
@@ -8,6 +9,7 @@ use axum::{
     body::{BoxBody, HttpBody},
     http::header,
 };
+use bytes::{Buf, BufMut, BytesMut};
 use futures_util::future::BoxFuture;
 use hickory_resolver::{error::ResolveError, lookup_ip::LookupIp, TokioAsyncResolver};
 use hyper::{
@@ -25,7 +27,7 @@ use tokio::{
     net::TcpStream,
 };
 use tokio_rustls::{client::TlsStream, TlsConnector};
-use tower::{util::BoxCloneService, Service, ServiceExt};
+use tower::{util::BoxCloneService, ServiceExt};
 use tower_http::{
     decompression::{DecompressionBody, DecompressionLayer},
     sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
@@ -56,16 +58,94 @@ impl Client {
     {
         let req = request.map(|b| b.map_err(axum::Error::new).boxed_unsync());
 
-        let mut service = self.inner.clone();
-        service.ready().await?;
-
-        let res = service
-            .call(req)
+        let res = self
+            .inner
+            .clone()
+            .oneshot(req)
             .await?
             .map(|b| b.map_err(axum::Error::new).boxed_unsync());
 
         Ok(res)
     }
+
+    /// Helper for calling JSON APIs.
+    ///
+    /// Automatically serializes the request's body and deserialize the response's.
+    ///
+    /// # Errors
+    ///
+    /// This method may fail for a multitude of reasons, see [`JsonApiError`] for more info.
+    pub async fn json_request<T, U>(&self, req: Request<T>) -> Result<U, JsonApiError>
+    where
+        T: serde::Serialize,
+        U: for<'de> serde::Deserialize<'de>,
+    {
+        let buffer = BytesMut::with_capacity(1024);
+        let mut writer = buffer.writer();
+
+        serde_json::to_writer(&mut writer, req.body()).map_err(JsonApiError::Serialization)?;
+
+        let req = req.map(|_| {
+            #[allow(unreachable_code)]
+            http_body::Full::new(writer.into_inner().freeze())
+                .map_err(|_| unreachable!() as axum::Error)
+                .boxed_unsync()
+        });
+
+        let res = self.do_json_api_request(req).await?;
+
+        let body = hyper::body::aggregate(res.into_body())
+            .await
+            .map_err(JsonApiError::ResponseBody)?;
+
+        serde_json::from_reader(body.reader()).map_err(JsonApiError::Deserialization)
+    }
+
+    #[inline(never)]
+    async fn do_json_api_request(
+        &self,
+        mut req: Request<BoxBody>,
+    ) -> Result<Response<DecompressionBody<Body>>, JsonApiError> {
+        if !req.headers().contains_key(hyper::header::CONTENT_TYPE) {
+            req.headers_mut().append(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static("application/json"),
+            );
+        }
+
+        let res = self
+            .inner
+            .clone()
+            .oneshot(req)
+            .await
+            .map_err(JsonApiError::Response)?;
+
+        if res.status().is_client_error() {
+            return Err(JsonApiError::Client(res));
+        }
+
+        if res.status().is_server_error() {
+            Err(JsonApiError::Server(res))
+        } else {
+            Ok(res)
+        }
+    }
+}
+
+/// Errors that may happen with a call to [`Client::json_api_request`].
+pub enum JsonApiError {
+    /// The response failed with a status code of class 4XX.
+    Client(Response<DecompressionBody<Body>>),
+    /// The response failed with a status code of class 5XX.
+    Server(Response<DecompressionBody<Body>>),
+    /// The request failed to be sent.
+    Response(hyper::Error),
+    /// The request body failed to be serialized.
+    Serialization(serde_json::Error),
+    /// The response body failed to be deserialized.
+    Deserialization(serde_json::Error),
+    /// Some error ocurred while reading the response data.
+    ResponseBody(Box<dyn Error + Send + Sync>),
 }
 
 impl Default for Client {
@@ -267,7 +347,7 @@ impl tower::Service<Uri> for HttpsConnector {
     }
 }
 
-pub struct TlsConnection {
+struct TlsConnection {
     inner: TlsStream<TcpStream>,
 }
 
