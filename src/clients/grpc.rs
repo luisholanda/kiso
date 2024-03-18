@@ -1,11 +1,29 @@
-use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    net::IpAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
-use hickory_resolver::TokioAsyncResolver;
+use axum::http::HeaderValue;
+use bytes::Buf;
+use futures_util::future::BoxFuture;
+use hickory_resolver::{error::ResolveErrorKind, lookup_ip::LookupIpIter, TokioAsyncResolver};
+use hyper::{body::HttpBody, Request, Response};
+use opentelemetry::trace::Status;
+use opentelemetry_semantic_conventions::trace;
 use tokio::{sync::mpsc::Sender, task::AbortHandle};
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint, Uri};
-use tower::{discover::Change, Service};
+use tonic::{
+    body::BoxBody,
+    transport::{Channel, ClientTlsConfig, Endpoint, Uri},
+};
+use tower::{discover::Change, util::BoxCloneService, Service, ServiceBuilder};
 
-use crate::clients::HttpsClientSettings;
+use super::https::{TracedBody, TracingService as HttpTracingService};
+use crate::{clients::HttpsClientSettings, context::Deadline, observability::tracing::Span};
 
 /// A production-ready gRPC channel.
 ///
@@ -18,7 +36,8 @@ use crate::clients::HttpsClientSettings;
 ///
 /// # Deadlines
 ///
-/// TODO
+/// The channel automatically sets the `grpc-timeout` header, based on the context
+/// value for [`Deadline`], which the kiso's server implementation sets automatically.
 ///
 /// # Retries
 ///
@@ -26,10 +45,17 @@ use crate::clients::HttpsClientSettings;
 ///
 /// # Tracing
 ///
-/// TODO
+/// This channel automatically creates two spans for each RPC request made through it:
+/// one for the RPC itself, and another for the response's body recv window. In both,
+/// the channel send logs for each message received/sent, allowing for easier understanding
+/// of message timings.
 #[derive(Clone)]
 pub struct GrpcChannel {
-    inner: Channel,
+    inner: BoxCloneService<
+        Request<BoxBody>,
+        Response<TracedBody<LogMsgsBody<hyper::Body>>>,
+        tonic::transport::Error,
+    >,
     // Will kill the background resolver task when the last channel is dropped.
     _resolver_task_aborter: Arc<Aborter>,
 }
@@ -38,26 +64,57 @@ impl GrpcChannel {
     /// Create a new channel, with the given settings.
     ///
     /// If no settings modifications are needed, use [`GrpcChannel::with_default_settings`].
-    pub async fn new(
-        uri: Uri,
+    pub fn new(
+        uri: &Uri,
         opts: GrpcChannelSettings,
-        https_client_settings: HttpsClientSettings,
+        mut https_settings: HttpsClientSettings,
     ) -> Self {
+        // TODO: stop using tonic's default Channel.
+        //
+        // It doesn't allow us to implement all the features we want, specially load-based load balacing
+        // and service rediscovery on disconnects. It also handles timeouts too low in the stack, which
+        // can cause problems on high load.
         let (inner, tx) =
             Channel::balance_channel::<IpAddr>(opts.grpc_channel_load_balancing_initial_capacity);
+        let default_deadline = opts.grpc_channel_default_deadline;
+
+        let service = ServiceBuilder::new()
+            .boxed_clone()
+            .map_response(|res: Response<LogMsgsBody<hyper::Body>>| res.map(TracedBody::new))
+            .layer(https_settings.take_request_sensitive_headers_layer())
+            .layer(https_settings.take_response_sensitive_headers_layer())
+            .layer_fn(|inner| HttpTracingService { inner })
+            .layer_fn(|inner| TracingService { inner })
+            .map_request(move |mut req: Request<BoxBody>| {
+                let timeout = crate::context::try_current::<Deadline>()
+                    .map_or(default_deadline, |d| d.timeout());
+
+                let header = HeaderValue::from_str(&duration_to_grpc_timeout(timeout))
+                    .expect("invalid grpc-timeout header value");
+                req.headers_mut().insert("grpc-timeout", header);
+
+                req
+            })
+            .service(inner);
 
         let mut resolver = Box::new(BackgroundResolver {
             resolver: TokioAsyncResolver::tokio_from_system_conf()
                 .expect("failed to initialize resolver"),
             scheme: uri.scheme_str().unwrap_or("https").to_string(),
-            host: uri.host().expect("no host in service URI").to_string(),
+            host: {
+                let mut host = uri.host().expect("no host in service URI").to_string();
+                if !host.ends_with('.') {
+                    host.push('.');
+                }
+                host
+            },
             port: uri.port_u16().unwrap_or(443),
             path_and_query: uri.path_and_query().map_or("", |p| p.as_str()).to_string(),
             previous_set: HashSet::default(),
             new_set: HashSet::default(),
             tx,
             grpc_settings: opts,
-            https_settings: https_client_settings,
+            https_settings,
         });
 
         let handle = crate::rt::spawn(async move {
@@ -67,14 +124,14 @@ impl GrpcChannel {
         });
 
         Self {
-            inner,
+            inner: service,
             _resolver_task_aborter: Arc::new(Aborter(handle.abort_handle())),
         }
     }
 
     /// Create a new channel, with the default command line given settings.
-    pub async fn with_default_settings(uri: Uri) -> Self {
-        Self::new(uri, crate::settings::get(), crate::settings::get()).await
+    pub fn with_default_settings(uri: &Uri) -> Self {
+        Self::new(uri, crate::settings::get(), crate::settings::get())
     }
 }
 
@@ -86,22 +143,16 @@ impl Drop for Aborter {
     }
 }
 
-impl<Req> Service<Req> for GrpcChannel
-where
-    Channel: Service<Req>,
-{
-    type Response = <Channel as Service<Req>>::Response;
-    type Error = <Channel as Service<Req>>::Error;
-    type Future = <Channel as Service<Req>>::Future;
+impl Service<Request<BoxBody>> for GrpcChannel {
+    type Response = Response<TracedBody<LogMsgsBody<hyper::Body>>>;
+    type Error = tonic::transport::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Req) -> Self::Future {
+    fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
         self.inner.call(req)
     }
 }
@@ -115,6 +166,9 @@ crate::settings!(pub GrpcChannelSettings {
     ///
     /// Defaults to 1024.
     grpc_channel_buffer_size: usize = 1024,
+    /// Default deadline for RPC calls when no deadline is available in the context.
+    #[arg(value_parser = crate::settings::DurationParser)]
+    grpc_channel_default_deadline: Duration = Duration::from_secs(10),
 });
 
 struct BackgroundResolver {
@@ -132,36 +186,55 @@ struct BackgroundResolver {
 
 impl BackgroundResolver {
     async fn run_once(&mut self) {
+        match self.resolver.srv_lookup(&self.host).await {
+            Ok(srv_lookup) => {
+                self.process_ips(srv_lookup.ip_iter()).await;
+                tokio::time::sleep_until(srv_lookup.as_lookup().valid_until().into()).await;
+            }
+            Err(err) if matches!(err.kind(), ResolveErrorKind::NoRecordsFound { .. }) => {
+                self.lookup_ips_via_a_or_aaaa().await;
+            }
+            Err(err) => {
+                crate::error!("failed to resolve {}: {err:?}", self.host);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+
+    async fn lookup_ips_via_a_or_aaaa(&mut self) {
         match self.resolver.lookup_ip(&self.host).await {
             Err(err) => {
                 crate::error!("failed to resolve {}: {err:?}", self.host);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             Ok(lookup) => {
-                self.new_set.clear();
-
-                for ip in lookup.iter() {
-                    if !self.previous_set.contains(&ip) {
-                        let endpoint = self.endpoint_for_ip(ip);
-                        if self.tx.send(Change::Insert(ip, endpoint)).await.is_err() {
-                            return;
-                        };
-                    }
-
-                    self.new_set.insert(ip);
-                }
-
-                for &ip in self.previous_set.difference(&self.new_set) {
-                    if self.tx.send(Change::Remove(ip)).await.is_err() {
-                        return;
-                    }
-                }
-
-                std::mem::swap(&mut self.previous_set, &mut self.new_set);
-
+                self.process_ips(lookup.iter()).await;
                 tokio::time::sleep_until(lookup.valid_until().into()).await;
             }
         }
+    }
+
+    async fn process_ips(&mut self, ips: LookupIpIter<'_>) {
+        self.new_set.clear();
+
+        for ip in ips {
+            if !self.previous_set.contains(&ip) {
+                let endpoint = self.endpoint_for_ip(ip);
+                if self.tx.send(Change::Insert(ip, endpoint)).await.is_err() {
+                    return;
+                };
+            }
+
+            self.new_set.insert(ip);
+        }
+
+        for &ip in self.previous_set.difference(&self.new_set) {
+            if self.tx.send(Change::Remove(ip)).await.is_err() {
+                return;
+            }
+        }
+
+        std::mem::swap(&mut self.previous_set, &mut self.new_set);
     }
 
     fn endpoint_for_ip(&self, ip: IpAddr) -> Endpoint {
@@ -179,5 +252,139 @@ impl BackgroundResolver {
             .tcp_nodelay(true)
             .tls_config(ClientTlsConfig::new().domain_name(self.host.clone()))
             .expect("failed to build endpoint")
+    }
+}
+
+fn duration_to_grpc_timeout(dur: Duration) -> String {
+    const MAX_ALLOWED_TIMEOUT: u128 = 10_000_000;
+    const SUFFIXES: &[&str] = &["ns", "us", "ms", "s"];
+
+    let mut val = dur.as_nanos();
+    let mut suf_idx = 0;
+
+    while val > MAX_ALLOWED_TIMEOUT {
+        val /= 1000;
+        suf_idx += 1;
+    }
+
+    let suf = SUFFIXES.get(suf_idx).expect("deadline too large");
+
+    format!("{val}{suf}")
+}
+
+#[derive(Clone)]
+struct TracingService<S> {
+    inner: S,
+}
+
+impl<S, B2> Service<Request<BoxBody>> for TracingService<S>
+where
+    S: Service<Request<BoxBody>, Response = Response<B2>>,
+    S::Future: Future<Output = Result<Response<B2>, S::Error>> + Send + 'static,
+    S::Error: std::fmt::Display + 'static,
+    B2: 'static,
+{
+    type Response = Response<LogMsgsBody<B2>>;
+    type Error = S::Error;
+    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.path())
+            .expect("gRPC call without a path??");
+
+        let mut splits = path.rsplit('/');
+        let method = splits.next().unwrap();
+        let service = splits.next().unwrap();
+
+        let span = crate::context::current::<Span>();
+
+        let rpc_name = format!("{service}/{method}");
+        span.update_name(rpc_name.clone());
+        span.set_attribute(trace::RPC_SYSTEM, "grpc");
+        span.set_attribute(trace::RPC_SERVICE, service.to_string());
+        span.set_attribute(trace::RPC_METHOD, method.to_string());
+
+        let req = req.map(|b| LogMsgsBody::new("SENT", rpc_name.clone(), b).boxed_unsync());
+        let fut = self.inner.call(req);
+
+        Box::pin(async move {
+            let res = fut.await?;
+
+            if let Some(status) = tonic::Status::from_header_map(res.headers()) {
+                span.set_attribute(trace::RPC_GRPC_STATUS_CODE, status.code() as i64);
+                if status.code() != tonic::Code::Ok {
+                    span.set_status(Status::error(status.message().to_string()));
+                }
+            }
+
+            Ok(res.map(|b| LogMsgsBody::new("RECV", rpc_name, b)))
+        })
+    }
+}
+
+pub struct LogMsgsBody<B> {
+    body: B,
+    counter: i64,
+    typ: &'static str,
+    rpc_name: String,
+}
+
+impl<B> LogMsgsBody<B> {
+    fn new(typ: &'static str, rpc_name: String, body: B) -> Self {
+        Self {
+            body,
+            counter: 1,
+            typ,
+            rpc_name,
+        }
+    }
+}
+
+impl<B: HttpBody> HttpBody for LogMsgsBody<B>
+where
+    B::Error: std::fmt::Display,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_data(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+        let this = unsafe { self.get_unchecked_mut() };
+        match unsafe { std::task::ready!(Pin::new_unchecked(&mut this.body).poll_data(cx)?) } {
+            None => Poll::Ready(None),
+            Some(data_frame) => {
+                crate::debug!(
+                    "{}: {} message {} with size {}",
+                    this.rpc_name,
+                    this.counter,
+                    this.typ,
+                    data_frame.remaining()
+                )
+                .attr(
+                    trace::MESSAGE_COMPRESSED_SIZE,
+                    data_frame.remaining() as i64,
+                )
+                .attr(trace::MESSAGE_ID, this.counter)
+                .attr(trace::MESSAGE_TYPE, this.typ);
+
+                Poll::Ready(Some(Ok(data_frame)))
+            }
+        }
+    }
+
+    fn poll_trailers(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<hyper::HeaderMap>, Self::Error>> {
+        unsafe { self.map_unchecked_mut(|b| &mut b.body) }.poll_trailers(cx)
     }
 }

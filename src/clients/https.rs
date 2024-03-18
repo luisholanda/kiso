@@ -168,7 +168,7 @@ impl Client {
     /// support HTTP/2, but the all others do.
     ///
     /// If this isn't needed, prever to use the default instance.
-    pub fn new(settings: HttpsClientSettings) -> Self {
+    pub fn new(mut settings: HttpsClientSettings) -> Self {
         let default_timeout = settings.https_client_default_timeout;
 
         let client = hyper::Client::builder()
@@ -178,30 +178,10 @@ impl Client {
             .http2_keep_alive_while_idle(settings.https_client_http2_keep_alive_while_idle)
             .build(HttpsConnector::default());
 
-        let mut req_sensitive_hdrs = vec![
-            header::AUTHORIZATION,
-            header::COOKIE,
-            header::PROXY_AUTHORIZATION,
-        ];
-
-        for hdr_name in settings.https_client_extra_request_sensitive_headers {
-            if let Ok(hdr) = header::HeaderName::try_from(hdr_name) {
-                req_sensitive_hdrs.push(hdr);
-            }
-        }
-
-        let mut res_sensitive_hdrs = vec![header::SET_COOKIE];
-
-        for hdr_name in settings.https_client_extra_response_sensitive_headers {
-            if let Ok(hdr) = header::HeaderName::try_from(hdr_name) {
-                res_sensitive_hdrs.push(hdr);
-            }
-        }
-
         let inner = tower::ServiceBuilder::new()
             .boxed_clone()
-            .layer(SetSensitiveRequestHeadersLayer::new(req_sensitive_hdrs))
-            .layer(SetSensitiveResponseHeadersLayer::new(res_sensitive_hdrs))
+            .layer(settings.take_request_sensitive_headers_layer())
+            .layer(settings.take_response_sensitive_headers_layer())
             .layer(DecompressionLayer::new())
             .map_response(|res: Response<Body>| res.map(TracedBody::new))
             .layer_fn(|inner| TracingService { inner })
@@ -257,6 +237,40 @@ crate::settings!(
         https_client_extra_response_sensitive_headers: Vec<String>,
     }
 );
+
+impl HttpsClientSettings {
+    pub(crate) fn take_request_sensitive_headers_layer(
+        &mut self,
+    ) -> SetSensitiveRequestHeadersLayer {
+        let mut req_sensitive_hdrs = vec![
+            header::AUTHORIZATION,
+            header::COOKIE,
+            header::PROXY_AUTHORIZATION,
+        ];
+
+        for hdr_name in self.https_client_extra_request_sensitive_headers.drain(..) {
+            if let Ok(hdr) = header::HeaderName::try_from(hdr_name) {
+                req_sensitive_hdrs.push(hdr);
+            }
+        }
+
+        SetSensitiveRequestHeadersLayer::new(req_sensitive_hdrs)
+    }
+
+    pub(crate) fn take_response_sensitive_headers_layer(
+        &mut self,
+    ) -> SetSensitiveResponseHeadersLayer {
+        let mut res_sensitive_hdrs = vec![header::SET_COOKIE];
+
+        for hdr_name in self.https_client_extra_response_sensitive_headers.drain(..) {
+            if let Ok(hdr) = header::HeaderName::try_from(hdr_name) {
+                res_sensitive_hdrs.push(hdr);
+            }
+        }
+
+        SetSensitiveResponseHeadersLayer::new(res_sensitive_hdrs)
+    }
+}
 
 #[derive(Clone)]
 struct HttpsConnector {
@@ -400,8 +414,8 @@ impl AsyncWrite for TlsConnection {
 }
 
 #[derive(Clone)]
-struct TracingService<S> {
-    inner: S,
+pub(super) struct TracingService<S> {
+    pub(super) inner: S,
 }
 
 impl<S, B1, B2> Service<Request<B1>> for TracingService<S>
@@ -511,8 +525,8 @@ where
 pub struct TracedBody<B> {
     body: B,
     span: Span,
-    data_frames: u64,
-    body_size: u64,
+    data_frames: i64,
+    body_size: i64,
 }
 
 impl<B> TracedBody<B> {
@@ -542,7 +556,7 @@ where
             None => Poll::Ready(None),
             Some(Ok(data_frame)) => {
                 this.data_frames += 1;
-                this.body_size += data_frame.remaining() as u64;
+                this.body_size += data_frame.remaining() as i64;
 
                 Poll::Ready(Some(Ok(data_frame)))
             }
@@ -575,9 +589,9 @@ where
                 }
 
                 this.span
-                    .set_attribute(trace::HTTP_RESPONSE_BODY_SIZE, this.body_size as i64);
+                    .set_attribute(trace::HTTP_RESPONSE_BODY_SIZE, this.body_size);
                 this.span
-                    .set_attribute("http.response.body.data_frames", this.data_frames as i64);
+                    .set_attribute("http.response.body.data_frames", this.data_frames);
 
                 Poll::Ready(Ok(trailers))
             }
