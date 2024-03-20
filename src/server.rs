@@ -145,26 +145,7 @@ impl Server {
 
         let mut futs = Vec::with_capacity(self.settings.server_acceptor_tasks_count as _);
         for _ in 0..self.settings.server_acceptor_tasks_count {
-            futs.push(async {
-                let listener = self.listen().await;
-                let addr_incoming =
-                    AddrIncoming::from_listener(listener).expect("failed to configure listener");
-
-                let notify = notify.clone();
-                let server = hyper::Server::builder(addr_incoming)
-                    .http2_only(self.grpc_enabled || self.settings.server_http2_only)
-                    .http2_adaptive_window(self.settings.server_http2_adaptive_flow_control)
-                    .http2_keep_alive_interval(Some(self.settings.server_http2_keep_alive_interval))
-                    .executor(KisoExecutor)
-                    .serve(service.clone())
-                    .with_graceful_shutdown(async move { notify.notified().await });
-
-                tokio::spawn(async move {
-                    if let Err(err) = server.await {
-                        crate::error!("Server killed unexpectedly: {err}");
-                    }
-                });
-            });
+            futs.push(self.start_server_listener(service.clone(), notify.clone()));
         }
 
         futures_util::future::join_all(futs).await;
@@ -178,7 +159,25 @@ impl Server {
         Shutdown(notify)
     }
 
-    async fn listen(&self) -> TcpListener {
+    async fn start_server_listener(&self, service: ServerService, notify: Arc<Notify>) {
+        let addr_incoming = self.listen().await;
+
+        let server = hyper::Server::builder(addr_incoming)
+            .http2_only(self.grpc_enabled || self.settings.server_http2_only)
+            .http2_adaptive_window(self.settings.server_http2_adaptive_flow_control)
+            .http2_keep_alive_interval(Some(self.settings.server_http2_keep_alive_interval))
+            .executor(KisoExecutor)
+            .serve(service)
+            .with_graceful_shutdown(async move { notify.notified().await });
+
+        tokio::spawn(async move {
+            if let Err(err) = server.await {
+                crate::error!("Server killed unexpectedly: {err}");
+            }
+        });
+    }
+
+    async fn listen(&self) -> AddrIncoming {
         crate::debug!(
             "Starting listener in {}:{}",
             self.settings.server_ip,
@@ -202,19 +201,10 @@ impl Server {
             panic!("failed to configure socket {sock_addr}: {err}");
         };
 
-        listener
+        AddrIncoming::from_listener(listener).expect("failed to configure listener")
     }
 
-    fn make_service(
-        &self,
-    ) -> tower::load_shed::LoadShed<
-        tower::limit::ConcurrencyLimit<
-            tower::util::ServiceFn<
-                impl FnMut(&AddrStream) -> axum::routing::future::IntoMakeServiceFuture<axum::Router>
-                    + Clone,
-            >,
-        >,
-    > {
+    fn make_service(&self) -> ServerService {
         let mut req_sensitive_hdrs = vec![
             header::AUTHORIZATION,
             header::COOKIE,
@@ -242,7 +232,7 @@ impl Server {
             .layer(CompressionLayer::new())
             .into_inner();
 
-        let mut axum_service = self.router.clone().layer(stack).into_make_service();
+        let axum_service = self.router.clone().layer(stack).into_make_service();
 
         let conn_limit = Arc::new(Semaphore::new(self.settings.server_connection_limit));
 
@@ -250,27 +240,9 @@ impl Server {
         tower::ServiceBuilder::new()
             .load_shed()
             .layer(GlobalConcurrencyLimitLayer::with_semaphore(conn_limit))
-            .service_fn(move |stream: &AddrStream| {
-                crate::debug!(
-                    "New connection accepted: {}:{} -> {}:{}",
-                    stream.remote_addr().ip(),
-                    stream.remote_addr().port(),
-                    stream.local_addr().ip(),
-                    stream.local_addr().port()
-                )
-                .attr("peer_ip", stream.remote_addr().ip().to_string())
-                .attr("peer_port", stream.remote_addr().port());
-
-                let _res = (|| unsafe {
-                    let socket = socket2::Socket::from_raw_fd(stream.as_raw_fd());
-                    socket.set_nodelay(true)?;
-                    socket.set_thin_linear_timeouts(true)?;
-                    socket.set_linger(Some(settings.server_linger_timeout))?;
-
-                    Ok(()) as std::io::Result<()>
-                })();
-
-                axum_service.call(stream)
+            .service(MakeConnectionService {
+                inner: axum_service,
+                linger_timeout: settings.server_linger_timeout,
             })
     }
 
@@ -300,6 +272,53 @@ impl Server {
         }
 
         config
+    }
+}
+
+type ServerService =
+    tower::load_shed::LoadShed<tower::limit::ConcurrencyLimit<MakeConnectionService>>;
+
+type AxumMakeRouterService = axum::routing::IntoMakeService<axum::Router>;
+
+#[derive(Clone)]
+struct MakeConnectionService {
+    inner: AxumMakeRouterService,
+    linger_timeout: Duration,
+}
+
+impl<'a> Service<&'a AddrStream> for MakeConnectionService {
+    type Response = <AxumMakeRouterService as Service<&'a AddrStream>>::Response;
+    type Error = <AxumMakeRouterService as Service<&'a AddrStream>>::Error;
+    type Future = <AxumMakeRouterService as Service<&'a AddrStream>>::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        <AxumMakeRouterService as Service<&'a AddrStream>>::poll_ready(&mut self.inner, cx)
+    }
+
+    fn call(&mut self, stream: &'_ AddrStream) -> Self::Future {
+        crate::debug!(
+            "New connection accepted: {}:{} -> {}:{}",
+            stream.remote_addr().ip(),
+            stream.remote_addr().port(),
+            stream.local_addr().ip(),
+            stream.local_addr().port()
+        )
+        .attr("peer_ip", stream.remote_addr().ip().to_string())
+        .attr("peer_port", stream.remote_addr().port());
+
+        let _res = (|| unsafe {
+            let socket = socket2::Socket::from_raw_fd(stream.as_raw_fd());
+            socket.set_nodelay(true)?;
+            socket.set_thin_linear_timeouts(true)?;
+            socket.set_linger(Some(self.linger_timeout))?;
+
+            Ok(()) as std::io::Result<()>
+        })();
+
+        self.inner.call(stream)
     }
 }
 
