@@ -45,35 +45,9 @@ macro_rules! settings {
         $vis struct $ty_name {
             $(
                 $(#[$meta])+
-                #[arg(long)]
+                #[arg(long, required(false))]
                 $vis $setting: $ty,
             )+
-        }
-
-        impl $ty_name {
-            const __SETTINGS_IMPL: () = {
-                #[derive($crate::settings::__Parser)]
-                #[group(id = stringify!($ty_name))]
-                $vis struct Inner {
-                    $(
-                        $(#[$meta])+
-                        #[arg(long)]
-                        $setting: Option<$ty>,
-                    )+
-                }
-
-                impl $crate::settings::SettingsFromArgs for $ty_name {
-                    type Args = Inner;
-
-                    fn update_from_args(&mut self, args: Inner) {
-                        $(
-                            if let Some(val) = args.$setting {
-                                self.$setting = val;
-                            }
-                        )+
-                    }
-                }
-            };
         }
 
         impl ::std::default::Default for $ty_name {
@@ -94,11 +68,9 @@ macro_rules! settings {
     };
 }
 
-pub trait SettingsFromArgs: Default {
-    type Args: clap::FromArgMatches + clap::Args;
+pub trait SettingsFromArgs: Default + clap::FromArgMatches + clap::Args {}
 
-    fn update_from_args(&mut self, args: Self::Args);
-}
+impl<T> SettingsFromArgs for T where T: Default + clap::FromArgMatches + clap::Args {}
 
 /// Application settings.
 ///
@@ -115,19 +87,12 @@ impl Settings {
     }
 
     fn get<T: SettingsFromArgs>(&self) -> T {
-        use clap::FromArgMatches;
-
-        let args = match T::Args::from_arg_matches(&self.cmdline_matches) {
-            Ok(args) => args,
-            Err(err) => {
-                err.print().expect("failed to write Settings parsing error");
-                std::panic::panic_any(err);
-            }
-        };
-
         let mut settings = T::default();
 
-        settings.update_from_args(args);
+        if let Err(err) = settings.update_from_arg_matches(&self.cmdline_matches) {
+            err.print().expect("failed to write Settings parsing error");
+            std::panic::panic_any(err);
+        };
 
         settings
     }
@@ -143,7 +108,7 @@ impl SettingsBuilder {
     ///
     /// This will allow one to call [`Settings::get`] with `A` later on.
     pub fn register<A: SettingsFromArgs>(mut self) -> Self {
-        self.cmd = <A::Args as clap::Args>::augment_args(self.cmd);
+        self.cmd = A::augment_args(self.cmd);
         self
     }
 
