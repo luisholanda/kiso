@@ -21,7 +21,7 @@ pub fn builder(cmd_descriptor: CmdDescriptor) -> SettingsBuilder {
 /// Panics, without calling the panic hook, if the segment can be extracted
 /// from the command line arguments. In this case an error message will be
 /// printed informing the problem.
-pub fn get<T: clap::FromArgMatches>() -> T {
+pub fn get<T: SettingsFromArgs>() -> T {
     SETTINGS.get().expect("Settings not installed").get()
 }
 
@@ -45,11 +45,59 @@ macro_rules! settings {
         $vis struct $ty_name {
             $(
                 $(#[$meta])+
-                #[arg(long, $(default_value = stringify!($default))?)]
+                #[arg(long)]
                 $vis $setting: $ty,
             )+
         }
+
+        impl $ty_name {
+            const __SETTINGS_IMPL: () = {
+                #[derive($crate::settings::__Parser)]
+                #[group(id = stringify!($ty_name))]
+                $vis struct Inner {
+                    $(
+                        $(#[$meta])+
+                        #[arg(long)]
+                        $setting: Option<$ty>,
+                    )+
+                }
+
+                impl $crate::settings::SettingsFromArgs for $ty_name {
+                    type Args = Inner;
+
+                    fn update_from_args(&mut self, args: Inner) {
+                        $(
+                            if let Some(val) = args.$setting {
+                                self.$setting = val;
+                            }
+                        )+
+                    }
+                }
+            };
+        }
+
+        impl ::std::default::Default for $ty_name {
+            fn default() -> Self {
+                Self {
+                    $(
+                        $setting: $crate::settings!(__or_default $($default)?),
+                    )+
+                }
+            }
+        }
     };
+    (__or_default $default: expr) => {
+        $default
+    };
+    (__or_default) => {
+        ::std::default::Default::default()
+    };
+}
+
+pub trait SettingsFromArgs: Default {
+    type Args: clap::FromArgMatches + clap::Args;
+
+    fn update_from_args(&mut self, args: Self::Args);
 }
 
 /// Application settings.
@@ -66,14 +114,22 @@ impl Settings {
         }
     }
 
-    fn get<T: clap::FromArgMatches>(&self) -> T {
-        match T::from_arg_matches(&self.cmdline_matches) {
-            Ok(arg) => arg,
+    fn get<T: SettingsFromArgs>(&self) -> T {
+        use clap::FromArgMatches;
+
+        let args = match T::Args::from_arg_matches(&self.cmdline_matches) {
+            Ok(args) => args,
             Err(err) => {
                 err.print().expect("failed to write Settings parsing error");
                 std::panic::panic_any(err);
             }
-        }
+        };
+
+        let mut settings = T::default();
+
+        settings.update_from_args(args);
+
+        settings
     }
 }
 
@@ -86,8 +142,8 @@ impl SettingsBuilder {
     /// Register the arguments for `A` in the command line parser.
     ///
     /// This will allow one to call [`Settings::get`] with `A` later on.
-    pub fn register<A: clap::Args>(mut self) -> Self {
-        self.cmd = A::augment_args(self.cmd);
+    pub fn register<A: SettingsFromArgs>(mut self) -> Self {
+        self.cmd = <A::Args as clap::Args>::augment_args(self.cmd);
         self
     }
 
@@ -97,8 +153,11 @@ impl SettingsBuilder {
         self = self
             .register::<crate::clients::HttpsClientSettings>()
             .register::<crate::server::ServerSettings>()
+            .register::<crate::server::GrpcServiceSettings>()
             .register::<crate::clients::GrpcChannelSettings>()
             .register::<crate::observability::ObservabilitySettings>();
+
+        self.cmd.build();
 
         let settings = Settings {
             cmdline_matches: self.cmd.get_matches(),

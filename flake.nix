@@ -1,10 +1,17 @@
 {
   inputs = {
-    cargo2nix.url = "github:cargo2nix/cargo2nix";
-    cargo2nix.inputs.rust-overlay.follows = "rust-overlay";
     flake-utils.follows = "cargo2nix/flake-utils";
     nixpkgs.follows = "cargo2nix/nixpkgs";
-    pre-commit-hooks.url = "github:cachix/pre-commit-hooks.nix";
+
+    cargo2nix = {
+      url = "github:cargo2nix/cargo2nix";
+      inputs.rust-overlay.follows = "rust-overlay";
+    };
+    pre-commit-hooks = {
+      url = "github:cachix/pre-commit-hooks.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-utils.follows = "flake-utils";
+    };
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -16,6 +23,9 @@
     with inputs;
       flake-utils.lib.eachDefaultSystem (
         system: let
+          inherit (pkgs.stdenv) isLinux;
+          inherit (nixpkgs.lib) optionalString;
+
           pkgs = import nixpkgs {
             inherit system;
             overlays = [
@@ -24,7 +34,7 @@
             ];
           };
 
-          rustVersion = "1.76.0";
+          rustVersion = "1.77.0";
 
           rustPkgs = pkgs.rustBuilder.makePackageSet {
             inherit rustVersion;
@@ -64,15 +74,20 @@
               inherit (pkgs.rust-bin.nightly.latest) rustfmt;
             };
           };
+
         in rec {
           checks.kiso-tests = rustPkgs.workspace.kiso { compileMode = "test"; };
 
           devShells.default = rustPkgs.workspaceShell {
             inherit (pre-commit) shellHook;
+
             packages = [
               pkgs.rust-bin.nightly.latest.rustfmt
               cargo2nix.packages.${system}.cargo2nix
             ];
+
+            RUSTC_FLAGS = "'-C linker=${pkgs.clang}/bin/clang'" 
+              + (optionalString isLinux "'-C link-arg=-fuse-ld=${pkgs.mold}/bin/mold'");
           };
 
           packages = {

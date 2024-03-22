@@ -1,7 +1,7 @@
 use std::{
     convert::Infallible,
     future::Future,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     os::fd::{AsRawFd, FromRawFd},
     sync::Arc,
     time::Duration,
@@ -191,11 +191,10 @@ impl Server {
             Err(err) => panic!("failed to bind socket {sock_addr}: {err}"),
         };
 
-        if let Err(err) = (|| unsafe {
-            let socket = socket2::Socket::from_raw_fd(listener.as_raw_fd());
+        if let Err(err) = (|| {
+            let socket = socket2::SockRef::from(&listener);
             socket.set_nodelay(true)?;
             socket.set_reuse_port(true)?;
-
             Ok(()) as std::io::Result<()>
         })() {
             panic!("failed to configure socket {sock_addr}: {err}");
@@ -356,17 +355,18 @@ crate::settings! {
         /// Defaults to 127.0.0.1.
         #[arg(value_parser = clap::builder::StringValueParser::new().try_map(|s| s.parse::<IpAddr>()))]
         server_ip: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST),
+        // TODO(io-uring): tokio doesn't support SO_REUSEPORT
         /// The number of connection acceptor tasks to spawn.
         ///
         /// When the server has to accept a high number of connections, increasing this
         /// number can help reduce the latency to stablish them.
         ///
-        /// Defaults to 2.
+        /// Defaults to 1.
         server_acceptor_tasks_count: u8 = 2,
         /// The limit of connections the server can handle at once.
         ///
         /// Defaults to no limit.
-        server_connection_limit: usize = usize::MAX,
+        server_connection_limit: usize = Semaphore::MAX_PERMITS,
         /// Timeout for queued messages to be sent when the server is shutdown.
         ///
         /// Defaults to 5s.
@@ -442,5 +442,51 @@ crate::settings! {
         /// This should be `<service name>=<concurrency>`.
         #[arg(long, value_parser = crate::settings::KeyValueParser::<clap::builder::RangedI64ValueParser<u32>>::default())]
         grpc_service_concurrency: Vec<(String, u32)>,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::CmdDescriptor;
+
+    #[ignore = "this doesn't work yet"]
+    #[tokio::test]
+    async fn test_server() {
+        crate::settings::builder(CmdDescriptor {
+            name: "test_server",
+            about: "A test for Server",
+        })
+        .install_from_args();
+
+        let mut server = Server {
+            grpc_enabled: true,
+            ..Default::default()
+        };
+
+        let shutdown = server.start().await;
+
+        let mut client = tonic_health::pb::health_client::HealthClient::new(
+            tonic::transport::Channel::builder("http://localhost:8080".parse().unwrap())
+                .connect_lazy(),
+        );
+
+        let resp = client
+            .check(tonic_health::pb::HealthCheckRequest {
+                service: "grpc.health.v1.Health".to_string(),
+            })
+            .await
+            .expect("failed to send RPC request");
+
+        assert_eq!(resp.into_inner().status, 1);
+
+        shutdown.shutdown();
+
+        client
+            .check(tonic_health::pb::HealthCheckRequest {
+                service: "grpc.health.v1.Health".to_string(),
+            })
+            .await
+            .expect_err("failed to send RPC request");
     }
 }

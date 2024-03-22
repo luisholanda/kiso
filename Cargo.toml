@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 axum = { version = "0.6.20", default-features = false }
 backtrace = "0.3.69"
 bytes = "1.5.0"
-clap = { version = "4.4.18", features = ["derive"] }
+clap = { version = "4.5.3", features = ["derive", "string"] }
 flume = "0.11.0"
 futures-util = "0.3.30"
 hickory-resolver = "0.24.0"
@@ -122,3 +122,7 @@ type_repetition_in_bounds = "warn"
 unnecessary_sort_by = "warn"
 unnecessary_wraps = "warn"
 useless_format = "warn"
+
+[profile.dev]
+debug = 0
+strip = "debuginfo"
