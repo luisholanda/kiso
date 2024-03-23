@@ -19,6 +19,7 @@ use crate::context::Deadline;
 pub(super) struct GrpcService {
     inner: BoxCloneService<Request<Body>, Response<BoxBody>, Box<dyn Error + Send + Sync>>,
     default_deadline: Duration,
+    overloaded: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,6 +63,7 @@ impl GrpcService {
         Self {
             inner: service,
             default_deadline: config.default_deadline,
+            overloaded: false,
         }
     }
 
@@ -79,12 +81,18 @@ impl Service<Request<Body>> for GrpcService {
     #[inline(always)]
     fn poll_ready(
         &mut self,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.overloaded = std::task::ready!(self.inner.poll_ready(cx)).is_err();
+
         std::task::Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
+        if std::mem::take(&mut self.overloaded) {
+            return Box::pin(std::future::ready(Ok(error_response(Code::Cancelled))));
+        }
+
         let start = Instant::now();
         let deadline = self.get_and_set_request_deadline(start, &req);
         let inner = crate::context::scope_sync(deadline, || self.inner.call(req));

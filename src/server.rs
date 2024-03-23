@@ -2,7 +2,6 @@ use std::{
     convert::Infallible,
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    os::fd::{AsRawFd, FromRawFd},
     sync::Arc,
     time::Duration,
 };
@@ -38,8 +37,8 @@ mod grpc;
 /// Automatically configures the following features:
 ///
 /// - Connection limit and load sheding.
-/// - Accept compressed bodies (TODO for HTTP).
-/// - Returns compressed bodies.
+/// - Accept compressed bodies (TODO).
+/// - Returns compressed bodies (TODO).
 /// - Health checking service and HTTP route.
 /// - Optimized HTTP/2 and socket configuration.
 /// - Graceful shutdown support.
@@ -120,8 +119,14 @@ impl Server {
 
         if self.grpc_enabled {
             crate::debug!("gRPC enabled, adding gprc.health.v1.Health service for health checking");
-            let (_, srv) = tonic_health::server::health_reporter();
+            let (mut reporter, srv) = tonic_health::server::health_reporter();
             self.add_grpc_service(srv);
+            reporter
+                .set_service_status(
+                    "grpc.health.v1.Health",
+                    tonic_health::ServingStatus::Serving,
+                )
+                .await;
         } else {
             crate::debug!(
                 "No gRPC service found, adding HTPT route '{}' for health checking",
@@ -186,21 +191,29 @@ impl Server {
 
         let sock_addr = SocketAddr::new(self.settings.server_ip, self.settings.server_port);
 
-        let listener = match TcpListener::bind(sock_addr).await {
-            Ok(l) => l,
-            Err(err) => panic!("failed to bind socket {sock_addr}: {err}"),
-        };
-
-        if let Err(err) = (|| {
-            let socket = socket2::SockRef::from(&listener);
-            socket.set_nodelay(true)?;
-            socket.set_reuse_port(true)?;
-            Ok(()) as std::io::Result<()>
-        })() {
-            panic!("failed to configure socket {sock_addr}: {err}");
-        };
+        let listener = self
+            .try_listen(sock_addr)
+            .unwrap_or_else(|err| panic!("failed to bind to {sock_addr}: {err:?}"));
 
         AddrIncoming::from_listener(listener).expect("failed to configure listener")
+    }
+
+    fn try_listen(&self, sock_addr: SocketAddr) -> std::io::Result<TcpListener> {
+        let addr: socket2::SockAddr = sock_addr.into();
+
+        let socket = socket2::Socket::new(
+            addr.domain(),
+            socket2::Type::STREAM.nonblocking(),
+            Some(socket2::Protocol::TCP),
+        )?;
+
+        socket.set_nodelay(true)?;
+        socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
+        socket.bind(&addr)?;
+        socket.listen(self.settings.server_connection_limit as _)?;
+
+        TcpListener::from_std(socket.into())
     }
 
     fn make_service(&self) -> ServerService {
@@ -231,17 +244,15 @@ impl Server {
             .layer(CompressionLayer::new())
             .into_inner();
 
-        let axum_service = self.router.clone().layer(stack).into_make_service();
+        let axum_service = self.router.clone().route_layer(stack).into_make_service();
 
         let conn_limit = Arc::new(Semaphore::new(self.settings.server_connection_limit));
 
-        let settings = self.settings.clone();
         tower::ServiceBuilder::new()
             .load_shed()
             .layer(GlobalConcurrencyLimitLayer::with_semaphore(conn_limit))
             .service(MakeConnectionService {
                 inner: axum_service,
-                linger_timeout: settings.server_linger_timeout,
             })
     }
 
@@ -282,7 +293,6 @@ type AxumMakeRouterService = axum::routing::IntoMakeService<axum::Router>;
 #[derive(Clone)]
 struct MakeConnectionService {
     inner: AxumMakeRouterService,
-    linger_timeout: Duration,
 }
 
 impl<'a> Service<&'a AddrStream> for MakeConnectionService {
@@ -307,15 +317,6 @@ impl<'a> Service<&'a AddrStream> for MakeConnectionService {
         )
         .attr("peer_ip", stream.remote_addr().ip().to_string())
         .attr("peer_port", stream.remote_addr().port());
-
-        let _res = (|| unsafe {
-            let socket = socket2::Socket::from_raw_fd(stream.as_raw_fd());
-            socket.set_nodelay(true)?;
-            socket.set_thin_linear_timeouts(true)?;
-            socket.set_linger(Some(self.linger_timeout))?;
-
-            Ok(()) as std::io::Result<()>
-        })();
 
         self.inner.call(stream)
     }
@@ -367,11 +368,6 @@ crate::settings! {
         ///
         /// Defaults to no limit.
         server_connection_limit: usize = Semaphore::MAX_PERMITS,
-        /// Timeout for queued messages to be sent when the server is shutdown.
-        ///
-        /// Defaults to 5s.
-        #[arg(value_parser = crate::settings::DurationParser)]
-        server_linger_timeout: Duration = Duration::from_secs(5),
         /// HTTP route to use for health checking when no gRPC service is enabled.
         server_http_health_checking_route: String = "/health".to_string(),
         /// If the server should require HTTP/2 connections.
@@ -450,7 +446,6 @@ mod tests {
     use super::*;
     use crate::settings::CmdDescriptor;
 
-    #[ignore = "this doesn't work yet"]
     #[tokio::test]
     async fn test_server() {
         crate::settings::builder(CmdDescriptor {
@@ -468,7 +463,9 @@ mod tests {
 
         let mut client = tonic_health::pb::health_client::HealthClient::new(
             tonic::transport::Channel::builder("http://localhost:8080".parse().unwrap())
-                .connect_lazy(),
+                .connect()
+                .await
+                .expect("failed to connect to server"),
         );
 
         let resp = client
@@ -482,11 +479,13 @@ mod tests {
 
         shutdown.shutdown();
 
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
         client
             .check(tonic_health::pb::HealthCheckRequest {
                 service: "grpc.health.v1.Health".to_string(),
             })
             .await
-            .expect_err("failed to send RPC request");
+            .expect_err("received response from a server that should be down");
     }
 }
