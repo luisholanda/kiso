@@ -1,0 +1,16 @@
+image: nixos/latest
+environment:
+  NIX_CONFIG: "experimental-features = nix-command flakes"
+sources:
+  - https://git.sr.ht/~luisholanda/kiso
+tasks:
+  - setup: |
+      cd kiso
+      nix flake archive
+  - build: |
+      cd kiso
+      nix build .#kiso
+  - checks: |
+      cd kiso
+      nix flake check
+      nix develop -c pre-commit run --all
