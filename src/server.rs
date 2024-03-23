@@ -21,10 +21,8 @@ use tokio::{
 };
 use tonic::server::NamedService;
 use tower::{limit::GlobalConcurrencyLimitLayer, Service};
-use tower_http::{
-    compression::CompressionLayer,
-    decompression::DecompressionBody,
-    sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
+use tower_http::sensitive_headers::{
+    SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer,
 };
 
 use self::grpc::ServiceConfiguration;
@@ -82,12 +80,15 @@ impl Server {
     ///
     /// Note that there is no need to mount the `gprc.health.v1.Health` service,
     /// as the server will add it automatically.
+    ///
+    /// Also, remember to properly configure compression and message sizes, as
+    /// there isn't a global way of doing this.
     pub fn add_grpc_service<S>(&mut self, service: S) -> &mut Self
     where
         S: Clone
             + NamedService
             + Service<
-                Request<DecompressionBody<Body>>,
+                Request<Body>,
                 Response = Response<UnsyncBoxBody<Bytes, tonic::Status>>,
                 Error = Infallible,
             > + Send
@@ -241,7 +242,6 @@ impl Server {
         let stack = tower::ServiceBuilder::new()
             .layer(SetSensitiveRequestHeadersLayer::new(req_sensitive_hdrs))
             .layer(SetSensitiveResponseHeadersLayer::new(res_sensitive_hdrs))
-            .layer(CompressionLayer::new())
             .into_inner();
 
         let axum_service = self.router.clone().route_layer(stack).into_make_service();

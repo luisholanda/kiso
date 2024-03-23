@@ -7,11 +7,10 @@ use std::{
 
 use axum::{body::BoxBody, extract::DefaultBodyLimit, http};
 use futures_util::{future::BoxFuture, Future, FutureExt as _, TryFutureExt as _};
-use http_body::{combinators::UnsyncBoxBody, Body as _};
-use hyper::{body::Bytes, Body, Request, Response};
+use http_body::Body as _;
+use hyper::{Body, Request, Response};
 use tonic::{body::BoxBody as TonicBoxBody, Code};
 use tower::{util::BoxCloneService, Service, ServiceBuilder};
-use tower_http::decompression::{DecompressionBody, RequestDecompressionLayer};
 
 use crate::context::Deadline;
 
@@ -32,10 +31,7 @@ pub(super) struct ServiceConfiguration {
 impl GrpcService {
     pub(super) fn new<S>(inner: S, config: ServiceConfiguration) -> Self
     where
-        S: Service<Request<DecompressionBody<Body>>, Response = Response<TonicBoxBody>>
-            + Clone
-            + Send
-            + 'static,
+        S: Service<Request<Body>, Response = Response<TonicBoxBody>> + Clone + Send + 'static,
         S::Future: Send + 'static,
         S::Error: Error + Send + Sync + 'static,
     {
@@ -49,15 +45,12 @@ impl GrpcService {
                 }
             })
             .map_future(catch_panic)
-            .map_response(
-                |res: Response<UnsyncBoxBody<Bytes, Box<dyn Error + Send + Sync>>>| {
-                    res.map(|b| b.map_err(axum::Error::new).boxed_unsync())
-                },
-            )
+            .map_response(|res: Response<TonicBoxBody>| {
+                res.map(|b| b.map_err(axum::Error::new).boxed_unsync())
+            })
             .load_shed()
             .concurrency_limit(config.request_concurrency_limit as usize)
             .layer(DefaultBodyLimit::max(config.body_limit))
-            .layer(RequestDecompressionLayer::new())
             .service(inner);
 
         Self {
