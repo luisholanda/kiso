@@ -18,6 +18,7 @@ use hyper::{
 use tokio::{
     net::TcpListener,
     sync::{Notify, Semaphore},
+    task::JoinHandle,
 };
 use tonic::server::NamedService;
 use tower::{limit::GlobalConcurrencyLimitLayer, Service};
@@ -156,7 +157,7 @@ impl Server {
             futs.push(self.start_server_listener(service.clone(), notify.clone()));
         }
 
-        futures_util::future::join_all(futs).await;
+        let server_tasks = futures_util::future::join_all(futs).await;
 
         crate::info!(
             "Server started! Listening on {}:{}",
@@ -164,10 +165,17 @@ impl Server {
             self.settings.server_port
         );
 
-        Shutdown(notify)
+        Shutdown {
+            notify,
+            server_tasks,
+        }
     }
 
-    async fn start_server_listener(&self, service: ServerService, notify: Arc<Notify>) {
+    async fn start_server_listener(
+        &self,
+        service: ServerService,
+        notify: Arc<Notify>,
+    ) -> JoinHandle<()> {
         let addr_incoming = self.listen().await;
 
         let server = hyper::Server::builder(addr_incoming)
@@ -182,7 +190,7 @@ impl Server {
             if let Err(err) = server.await {
                 crate::error!("Server killed unexpectedly: {err}");
             }
-        });
+        })
     }
 
     async fn listen(&self) -> AddrIncoming {
@@ -324,11 +332,23 @@ impl<'a> Service<&'a AddrStream> for MakeConnectionService {
     }
 }
 
-pub struct Shutdown(Arc<Notify>);
+pub struct Shutdown {
+    notify: Arc<Notify>,
+    server_tasks: Vec<JoinHandle<()>>,
+}
 
 impl Shutdown {
     pub fn shutdown(self) {
-        self.0.notify_waiters();
+        self.start_shutdown();
+    }
+
+    pub async fn shutdown_and_wait(self) {
+        self.start_shutdown();
+        futures_util::future::join_all(self.server_tasks).await;
+    }
+
+    fn start_shutdown(&self) {
+        self.notify.notify_waiters();
         crate::info!("Shutdown notified for server tasks");
     }
 }
@@ -479,9 +499,7 @@ mod tests {
 
         assert_eq!(resp.into_inner().status, 1);
 
-        shutdown.shutdown();
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown.shutdown_and_wait().await;
 
         client
             .check(tonic_health::pb::HealthCheckRequest {
