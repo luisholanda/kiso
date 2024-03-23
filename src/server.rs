@@ -27,10 +27,11 @@ use tower_http::{
     sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
 };
 
-use self::grpc::ServiceConfiguration;
+use self::{grpc::ServiceConfiguration, observability::Addrs};
 use crate::server::grpc::GrpcService;
 
 mod grpc;
+mod observability;
 
 /// A gRPC/HTTP server, preconfigured for production workloads.
 ///
@@ -44,7 +45,7 @@ mod grpc;
 /// - Graceful shutdown support.
 /// - Multiple acceptors for better connection establishment latency.
 /// - Mark certain request and response headers as sensitive.
-/// - Observability traces and metrics (TODO).
+/// - Observability traces and metrics (TODO for metris).
 pub struct Server {
     router: axum::Router,
     settings: ServerSettings,
@@ -251,9 +252,14 @@ impl Server {
         let stack = tower::ServiceBuilder::new()
             .layer(SetSensitiveRequestHeadersLayer::new(req_sensitive_hdrs))
             .layer(SetSensitiveResponseHeadersLayer::new(res_sensitive_hdrs))
+            .layer_fn(self::observability::TracingService::new)
             .into_inner();
 
-        let axum_service = self.router.clone().route_layer(stack).into_make_service();
+        let axum_service = self
+            .router
+            .clone()
+            .route_layer(stack)
+            .into_make_service_with_connect_info::<Addrs>();
 
         let conn_limit = Arc::new(Semaphore::new(self.settings.server_connection_limit));
 
@@ -297,7 +303,8 @@ impl Server {
 type ServerService =
     tower::load_shed::LoadShed<tower::limit::ConcurrencyLimit<MakeConnectionService>>;
 
-type AxumMakeRouterService = axum::routing::IntoMakeService<axum::Router>;
+type AxumMakeRouterService =
+    axum::extract::connect_info::IntoMakeServiceWithConnectInfo<axum::Router, Addrs>;
 
 #[derive(Clone)]
 struct MakeConnectionService {

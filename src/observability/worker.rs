@@ -134,7 +134,7 @@ impl Worker {
                 self.spans.insert(
                     light_span_ctx,
                     SpanData {
-                        span_context: ns.span_context,
+                        span_context: *ns.span_context,
                         parent_span_id: ns.parent_id,
                         span_kind: ns.kind,
                         name: ns.name,

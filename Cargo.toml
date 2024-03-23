@@ -7,7 +7,6 @@ description = "A foundation for gRPC services"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-axum = { version = "0.6.20", default-features = false }
 backtrace = "0.3.69"
 bytes = "1.5.0"
 clap = { version = "4.5.3", features = ["derive", "string"] }
@@ -29,6 +28,11 @@ signal-hook = "0.3.17"
 socket2 = { version = "0.5.5", features = ["all"] }
 tokio-rustls = "0.25.0"
 tonic-health = { version = "0.11.0", default-features = false }
+
+[dependencies.axum]
+version = "0.6.20"
+default-features = false
+features = ["matched-path", "tokio"]
 
 [dependencies.nix]
 version = "0.27.1"
