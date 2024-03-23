@@ -2,11 +2,8 @@
 //!
 //! Kiso uses tokio as it executor, but add extra configurations on top of the executor
 //! to ensure optimal performance for I/O bound servers.
-//!
-//! TODO(tracing): document tracing related features when implemented.
 use std::{
     future::Future,
-    process::Termination,
     sync::{atomic::AtomicU16, Arc},
     time::Duration,
 };
@@ -61,9 +58,19 @@ crate::settings!(pub(crate) RuntimeSettings {
 });
 
 /// Blocks the thread on the execution of a future.
-pub fn block_on<R: Termination>(fut: impl Future<Output = R>) -> R {
-    // SAFETY: RUNTIME already takes care of initializing the stall detector.
-    RUNTIME.block_on(unsafe { self::stall::detect_stall_on_poll(fut) })
+///
+/// Due to the runtime behavior when this function is called, it should only
+/// be used for entry-points, like the `main` function.
+///
+/// See [`tokio::runtime::Runtime::block_on`] for more info.
+pub fn block_on<F, R>(fut: F) -> R
+where
+    F: Future<Output = R> + Send + 'static,
+    R: Send,
+{
+    // We don't run fut directly on the current thread as to properly initialize
+    // the runtime and stall detection.
+    RUNTIME.block_on(spawn(fut)).expect("failed to join future")
 }
 
 /// Spawns a future inside Kiso's runtime as a new task.
@@ -143,5 +150,22 @@ fn runtime_thread_stop(_: &RuntimeSettings) -> impl Fn() + Send + Sync + 'static
         unsafe {
             self::stall::LocalStallDetector::unregister();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_block_on() {
+        let res = super::block_on(async { 1u8 });
+
+        assert_eq!(res, 1);
+    }
+
+    #[tokio::test]
+    async fn test_spawn() {
+        let res = super::spawn(async { 1u8 }).await.unwrap();
+
+        assert_eq!(res, 1);
     }
 }

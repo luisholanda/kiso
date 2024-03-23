@@ -83,7 +83,6 @@
 
             packages = [
               pkgs.rust-bin.nightly.latest.rustfmt
-              cargo2nix.packages.${system}.cargo2nix
             ];
 
             RUSTC_FLAGS = "'-C linker=${pkgs.clang}/bin/clang'" 

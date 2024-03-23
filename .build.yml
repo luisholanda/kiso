@@ -13,4 +13,4 @@ tasks:
   - checks: |
       cd kiso
       nix flake check
-      nix develop -c pre-commit run --all
+      nix develop -c pre-commit run --all --verbose
