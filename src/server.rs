@@ -21,8 +21,9 @@ use tokio::{
 };
 use tonic::server::NamedService;
 use tower::{limit::GlobalConcurrencyLimitLayer, Service};
-use tower_http::sensitive_headers::{
-    SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer,
+use tower_http::{
+    compression::CompressionLayer,
+    sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
 };
 
 use self::grpc::ServiceConfiguration;
@@ -35,8 +36,8 @@ mod grpc;
 /// Automatically configures the following features:
 ///
 /// - Connection limit and load sheding.
-/// - Accept compressed bodies (TODO).
-/// - Returns compressed bodies (TODO).
+/// - Accept compressed bodies for gRPC.
+/// - Returns compressed bodies (TODO for gRPC).
 /// - Health checking service and HTTP route.
 /// - Optimized HTTP/2 and socket configuration.
 /// - Graceful shutdown support.
@@ -69,8 +70,9 @@ impl Server {
     pub fn add_routes(&mut self, path: &str, router: axum::Router) -> &mut Self {
         crate::debug!("Mounting HTTP routes under {path}");
 
-        // TODO(http): add HTTP default middleware stack.
-        self.router = std::mem::take(&mut self.router).nest(path, router);
+        let layer = tower::ServiceBuilder::new().layer(CompressionLayer::new());
+
+        self.router = std::mem::take(&mut self.router).nest(path, router.route_layer(layer));
         self
     }
 
