@@ -50,6 +50,7 @@ pub struct Server {
     settings: ServerSettings,
     grpc_settings: GrpcServiceSettings,
     grpc_enabled: bool,
+    grpc_services: Vec<&'static str>,
 }
 
 impl Default for Server {
@@ -59,6 +60,7 @@ impl Default for Server {
             settings: crate::settings::get(),
             grpc_settings: crate::settings::get(),
             grpc_enabled: false,
+            grpc_services: vec!["grpc.health.v1.Health"],
         }
     }
 }
@@ -105,6 +107,7 @@ impl Server {
         let srv_config = self.get_service_config(S::NAME);
 
         self.grpc_enabled = true;
+        self.grpc_services.push(S::NAME);
         self.router = std::mem::take(&mut self.router).route_service(
             &format!("/{}/:method", S::NAME),
             GrpcService::new(service, srv_config),
@@ -125,12 +128,12 @@ impl Server {
             crate::debug!("gRPC enabled, adding gprc.health.v1.Health service for health checking");
             let (mut reporter, srv) = tonic_health::server::health_reporter();
             self.add_grpc_service(srv);
-            reporter
-                .set_service_status(
-                    "grpc.health.v1.Health",
-                    tonic_health::ServingStatus::Serving,
-                )
-                .await;
+
+            for srv in &self.grpc_services {
+                reporter
+                    .set_service_status(srv, tonic_health::ServingStatus::Serving)
+                    .await;
+            }
         } else {
             crate::debug!(
                 "No gRPC service found, adding HTPT route '{}' for health checking",
