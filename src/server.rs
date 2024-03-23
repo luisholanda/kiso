@@ -13,7 +13,7 @@ use hyper::{
     body::Bytes,
     header,
     server::conn::{AddrIncoming, AddrStream},
-    Body, Request, Response,
+    Body, Request, Response, StatusCode,
 };
 use tokio::{
     net::TcpListener,
@@ -134,16 +134,12 @@ impl Server {
                     .set_service_status(srv, tonic_health::ServingStatus::Serving)
                     .await;
             }
-        } else {
-            crate::debug!(
-                "No gRPC service found, adding HTPT route '{}' for health checking",
-                self.settings.server_http_health_checking_route
-            );
-            self.router = std::mem::take(&mut self.router).route(
-                &self.settings.server_http_health_checking_route,
-                axum::routing::get(|| std::future::ready(Response::new(Body::empty()))),
-            );
         }
+
+        self.router = std::mem::take(&mut self.router).route(
+            &self.settings.server_http_health_checking_route,
+            axum::routing::get(|| std::future::ready(StatusCode::OK)),
+        );
 
         crate::debug!("Server settings: {:?}", self.settings);
 
@@ -387,13 +383,13 @@ crate::settings! {
         /// When the server has to accept a high number of connections, increasing this
         /// number can help reduce the latency to stablish them.
         ///
-        /// Defaults to 1.
+        /// Defaults to 2.
         server_acceptor_tasks_count: u8 = 2,
         /// The limit of connections the server can handle at once.
         ///
         /// Defaults to no limit.
         server_connection_limit: usize = Semaphore::MAX_PERMITS,
-        /// HTTP route to use for health checking when no gRPC service is enabled.
+        /// Route to use for HTTP health checking.
         server_http_health_checking_route: String = "/health".to_string(),
         /// If the server should require HTTP/2 connections.
         ///
