@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     future::Future,
     net::IpAddr,
     pin::Pin,
@@ -10,8 +9,7 @@ use std::{
 
 use axum::http::HeaderValue;
 use bytes::Buf;
-use futures_util::future::BoxFuture;
-use hickory_resolver::{error::ResolveErrorKind, lookup_ip::LookupIpIter, TokioAsyncResolver};
+use futures_util::{future::BoxFuture, TryStreamExt};
 use hyper::{body::HttpBody, Request, Response};
 use opentelemetry::trace::Status;
 use opentelemetry_semantic_conventions::trace;
@@ -22,7 +20,10 @@ use tonic::{
 };
 use tower::{discover::Change, util::BoxCloneService, Service, ServiceBuilder};
 
-use super::https::{TracedBody, TracingService as HttpTracingService};
+use super::{
+    https::{TracedBody, TracingService as HttpTracingService},
+    resolver::ServiceDiscoveryStream,
+};
 use crate::{clients::HttpsClientSettings, context::Deadline, observability::tracing::Span};
 
 /// A production-ready gRPC channel.
@@ -97,31 +98,17 @@ impl GrpcChannel {
             })
             .service(inner);
 
-        let mut resolver = Box::new(BackgroundResolver {
-            resolver: TokioAsyncResolver::tokio_from_system_conf()
-                .expect("failed to initialize resolver"),
+        let resolver = Box::new(BackgroundResolver {
             scheme: uri.scheme_str().unwrap_or("https").to_string(),
-            host: {
-                let mut host = uri.host().expect("no host in service URI").to_string();
-                if !host.ends_with('.') {
-                    host.push('.');
-                }
-                host
-            },
             port: uri.port_u16().unwrap_or(443),
             path_and_query: uri.path_and_query().map_or("", |p| p.as_str()).to_string(),
-            previous_set: HashSet::default(),
-            new_set: HashSet::default(),
+            discovery_stream: ServiceDiscoveryStream::start(uri),
             tx,
             grpc_settings: opts,
             https_settings,
         });
 
-        let handle = crate::rt::spawn(async move {
-            loop {
-                resolver.run_once().await;
-            }
-        });
+        let handle = crate::rt::spawn(resolver.run());
 
         Self {
             inner: service,
@@ -172,69 +159,33 @@ crate::settings!(pub GrpcChannelSettings {
 });
 
 struct BackgroundResolver {
-    resolver: TokioAsyncResolver,
     scheme: String,
-    host: String,
     port: u16,
     path_and_query: String,
-    previous_set: HashSet<IpAddr>,
-    new_set: HashSet<IpAddr>,
+    discovery_stream: ServiceDiscoveryStream,
     tx: Sender<Change<IpAddr, Endpoint>>,
     grpc_settings: GrpcChannelSettings,
     https_settings: HttpsClientSettings,
 }
 
 impl BackgroundResolver {
-    async fn run_once(&mut self) {
-        match self.resolver.srv_lookup(&self.host).await {
-            Ok(srv_lookup) => {
-                self.process_ips(srv_lookup.ip_iter()).await;
-                tokio::time::sleep_until(srv_lookup.as_lookup().valid_until().into()).await;
-            }
-            Err(err) if matches!(err.kind(), ResolveErrorKind::NoRecordsFound { .. }) => {
-                self.lookup_ips_via_a_or_aaaa().await;
-            }
-            Err(err) => {
-                crate::error!("failed to resolve {}: {err:?}", self.host);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-
-    async fn lookup_ips_via_a_or_aaaa(&mut self) {
-        match self.resolver.lookup_ip(&self.host).await {
-            Err(err) => {
-                crate::error!("failed to resolve {}: {err:?}", self.host);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            Ok(lookup) => {
-                self.process_ips(lookup.iter()).await;
-                tokio::time::sleep_until(lookup.valid_until().into()).await;
-            }
-        }
-    }
-
-    async fn process_ips(&mut self, ips: LookupIpIter<'_>) {
-        self.new_set.clear();
-
-        for ip in ips {
-            if !self.previous_set.contains(&ip) {
-                let endpoint = self.endpoint_for_ip(ip);
-                if self.tx.send(Change::Insert(ip, endpoint)).await.is_err() {
+    async fn run(mut self) {
+        while !self.tx.is_closed() {
+            match self.discovery_stream.try_next().await {
+                Ok(Some(Change::Insert(ip, _))) => {
+                    let endpoint = self.endpoint_for_ip(ip);
+                    drop(self.tx.send(Change::Insert(ip, endpoint)).await);
+                }
+                Ok(Some(Change::Remove(ip))) => {
+                    drop(self.tx.send(Change::Remove(ip)).await);
+                }
+                Ok(None) => unreachable!("discovery stream never finishes"),
+                Err(err) => {
+                    crate::error!("resolve failure in service discovery: {err:?}");
                     return;
-                };
-            }
-
-            self.new_set.insert(ip);
-        }
-
-        for &ip in self.previous_set.difference(&self.new_set) {
-            if self.tx.send(Change::Remove(ip)).await.is_err() {
-                return;
+                }
             }
         }
-
-        std::mem::swap(&mut self.previous_set, &mut self.new_set);
     }
 
     fn endpoint_for_ip(&self, ip: IpAddr) -> Endpoint {
@@ -250,7 +201,7 @@ impl BackgroundResolver {
             .http2_keep_alive_interval(self.https_settings.https_client_http2_keep_alive_interval)
             .buffer_size(self.grpc_settings.grpc_channel_buffer_size)
             .tcp_nodelay(true)
-            .tls_config(ClientTlsConfig::new().domain_name(self.host.clone()))
+            .tls_config(ClientTlsConfig::new().domain_name(self.discovery_stream.host()))
             .expect("failed to build endpoint")
     }
 }

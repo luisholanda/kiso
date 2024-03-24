@@ -14,7 +14,7 @@ use axum::{
 };
 use bytes::{Buf, BufMut, BytesMut};
 use futures_util::future::BoxFuture;
-use hickory_resolver::{error::ResolveError, lookup_ip::LookupIp, TokioAsyncResolver};
+use hickory_resolver::error::ResolveError;
 use http_body::SizeHint;
 use hyper::{
     body::Bytes,
@@ -274,7 +274,6 @@ impl HttpsClientSettings {
 
 #[derive(Clone)]
 struct HttpsConnector {
-    resolver: Arc<TokioAsyncResolver>,
     connector: TlsConnector,
 }
 
@@ -298,25 +297,14 @@ impl Default for HttpsConnector {
         });
 
         Self {
-            resolver: TokioAsyncResolver::tokio_from_system_conf()
-                .expect("failed to create DNS resolver")
-                .into(),
             connector: TlsConnector::from(TLS_CONFIG.clone()),
         }
     }
 }
 
 impl HttpsConnector {
-    async fn resolve_uri(&self, uri: &Uri) -> Result<LookupIp, ResolveError> {
-        let Some(host) = uri.host() else {
-            panic!("tried to resolve URI without host: {uri}");
-        };
-
-        self.resolver.lookup_ip(host).await
-    }
-
     async fn connect(&self, uri: &Uri) -> Result<TcpStream, ResolveError> {
-        let ips = self.resolve_uri(uri).await?;
+        let ips = super::resolver::resolve_uri(uri).await?;
 
         let port = uri.port_u16().unwrap_or(443);
 
