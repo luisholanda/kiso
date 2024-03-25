@@ -1,0 +1,17 @@
+[package]
+name = "echo"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+backtrace.workspace = true
+futures-util.workspace = true
+kiso.workspace = true
+prost.version = "0.12.0"
+opentelemetry-stdout = { version = "0.3.0", features = ["logs"] }
+tonic.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true

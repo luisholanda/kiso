@@ -9,8 +9,10 @@ tasks:
       nix flake archive
   - build: |
       cd kiso
-      nix build .#kiso
+      nix build -j auto .#kiso
   - checks: |
       cd kiso
-      nix flake check
       nix develop -c pre-commit run --all --verbose
+  - benchmark-echo: |
+      cd kiso
+      nix run .#benchmark-echo

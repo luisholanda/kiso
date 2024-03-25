@@ -17,6 +17,7 @@ use hyper::{
 };
 use tokio::{
     net::TcpListener,
+    signal::unix::SignalKind,
     sync::{Notify, Semaphore},
     task::JoinHandle,
 };
@@ -71,7 +72,7 @@ impl Server {
     ///
     /// The routes are nested in the given path, i.e. if the router contains
     /// a route `/bar` and `path` is `/foo`, the route will be available in `/foo/bar`.
-    pub fn add_routes(&mut self, path: &str, router: axum::Router) -> &mut Self {
+    pub fn add_routes(mut self, path: &str, router: axum::Router) -> Self {
         crate::debug!("Mounting HTTP routes under {path}");
 
         let layer = tower::ServiceBuilder::new().layer(CompressionLayer::new());
@@ -89,7 +90,7 @@ impl Server {
     ///
     /// Also, remember to properly configure compression and message sizes, as
     /// there isn't a global way of doing this.
-    pub fn add_grpc_service<S>(&mut self, service: S) -> &mut Self
+    pub fn add_grpc_service<S>(mut self, service: S) -> Self
     where
         S: Clone
             + NamedService
@@ -122,13 +123,13 @@ impl Server {
     /// listening in the socket configured by `--server-ip` and `--server-port`.
     ///
     /// Returns a [`Shutdown`] that can be used to gracefully shutdown the server.
-    pub async fn start(&mut self) -> Shutdown {
+    pub async fn start(mut self) -> Shutdown {
         crate::info!("Starting server...");
 
         if self.grpc_enabled {
             crate::debug!("gRPC enabled, adding gprc.health.v1.Health service for health checking");
             let (mut reporter, srv) = tonic_health::server::health_reporter();
-            self.add_grpc_service(srv);
+            self = self.add_grpc_service(srv);
 
             for srv in &self.grpc_services {
                 reporter
@@ -152,12 +153,18 @@ impl Server {
         let notify = Arc::new(Notify::new());
         let service = self.make_service();
 
-        let mut futs = Vec::with_capacity(self.settings.server_acceptor_tasks_count as _);
+        let mut server_tasks = Vec::with_capacity(self.settings.server_acceptor_tasks_count as _);
         for _ in 0..self.settings.server_acceptor_tasks_count {
-            futs.push(self.start_server_listener(service.clone(), notify.clone()));
-        }
+            let task = start_server_listener(
+                service.clone(),
+                notify.clone(),
+                &self.settings,
+                self.grpc_enabled,
+            )
+            .await;
 
-        let server_tasks = futures_util::future::join_all(futs).await;
+            server_tasks.push(task);
+        }
 
         crate::info!(
             "Server started! Listening on {}:{}",
@@ -169,62 +176,6 @@ impl Server {
             notify,
             server_tasks,
         }
-    }
-
-    async fn start_server_listener(
-        &self,
-        service: ServerService,
-        notify: Arc<Notify>,
-    ) -> JoinHandle<()> {
-        let addr_incoming = self.listen().await;
-
-        let server = hyper::Server::builder(addr_incoming)
-            .http2_only(self.grpc_enabled || self.settings.server_http2_only)
-            .http2_adaptive_window(self.settings.server_http2_adaptive_flow_control)
-            .http2_keep_alive_interval(Some(self.settings.server_http2_keep_alive_interval))
-            .executor(KisoExecutor)
-            .serve(service)
-            .with_graceful_shutdown(async move { notify.notified().await });
-
-        tokio::spawn(async move {
-            if let Err(err) = server.await {
-                crate::error!("Server killed unexpectedly: {err}");
-            }
-        })
-    }
-
-    async fn listen(&self) -> AddrIncoming {
-        crate::debug!(
-            "Starting listener in {}:{}",
-            self.settings.server_ip,
-            self.settings.server_port
-        );
-
-        let sock_addr = SocketAddr::new(self.settings.server_ip, self.settings.server_port);
-
-        let listener = self
-            .try_listen(sock_addr)
-            .unwrap_or_else(|err| panic!("failed to bind to {sock_addr}: {err:?}"));
-
-        AddrIncoming::from_listener(listener).expect("failed to configure listener")
-    }
-
-    fn try_listen(&self, sock_addr: SocketAddr) -> std::io::Result<TcpListener> {
-        let addr: socket2::SockAddr = sock_addr.into();
-
-        let socket = socket2::Socket::new(
-            addr.domain(),
-            socket2::Type::STREAM.nonblocking(),
-            Some(socket2::Protocol::TCP),
-        )?;
-
-        socket.set_nodelay(true)?;
-        socket.set_reuse_address(true)?;
-        socket.set_reuse_port(true)?;
-        socket.bind(&addr)?;
-        socket.listen(self.settings.server_connection_limit as _)?;
-
-        TcpListener::from_std(socket.into())
     }
 
     fn make_service(&self) -> ServerService {
@@ -300,6 +251,59 @@ impl Server {
     }
 }
 
+async fn start_server_listener(
+    service: ServerService,
+    notify: Arc<Notify>,
+    settings: &ServerSettings,
+    grpc_enabled: bool,
+) -> JoinHandle<()> {
+    let try_listen = |sock_addr: SocketAddr| {
+        let addr: socket2::SockAddr = sock_addr.into();
+
+        let socket = socket2::Socket::new(
+            addr.domain(),
+            socket2::Type::STREAM.nonblocking(),
+            Some(socket2::Protocol::TCP),
+        )?;
+
+        socket.set_nodelay(true)?;
+        socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
+        socket.bind(&addr)?;
+        socket.listen(settings.server_connection_limit as _)?;
+
+        TcpListener::from_std(socket.into())
+    };
+
+    crate::debug!(
+        "Starting listener in {}:{}",
+        settings.server_ip,
+        settings.server_port
+    );
+
+    let sock_addr = SocketAddr::new(settings.server_ip, settings.server_port);
+
+    let listener = try_listen(sock_addr)
+        .unwrap_or_else(|err| panic!("failed to bind to {sock_addr}: {err:?}"));
+
+    let addr_incoming =
+        AddrIncoming::from_listener(listener).expect("failed to configure listener");
+
+    let server = hyper::Server::builder(addr_incoming)
+        .http2_only(grpc_enabled || settings.server_http2_only)
+        .http2_adaptive_window(settings.server_http2_adaptive_flow_control)
+        .http2_keep_alive_interval(Some(settings.server_http2_keep_alive_interval))
+        .executor(KisoExecutor)
+        .serve(service)
+        .with_graceful_shutdown(async move { notify.notified().await });
+
+    tokio::spawn(async move {
+        if let Err(err) = server.await {
+            crate::error!("Server killed unexpectedly: {err}");
+        }
+    })
+}
+
 type ServerService =
     tower::load_shed::LoadShed<tower::limit::ConcurrencyLimit<MakeConnectionService>>;
 
@@ -351,6 +355,31 @@ impl Shutdown {
     pub async fn shutdown_and_wait(self) {
         self.start_shutdown();
         futures_util::future::join_all(self.server_tasks).await;
+    }
+
+    pub async fn wait_for_shutdown_signals(self) {
+        let (mut sigterm, mut sigint) = tokio::task::spawn_blocking(|| {
+            let sigterm = tokio::signal::unix::signal(SignalKind::terminate())
+                .expect("failed to register SIGTERM handler");
+
+            let sigint = tokio::signal::unix::signal(SignalKind::interrupt())
+                .expect("failed to register SIGINT handler");
+
+            (sigterm, sigint)
+        })
+        .await
+        .unwrap();
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                crate::info!("received SIGTERM, shutting down server");
+            },
+            _ = sigint.recv() => {
+                crate::info!("received SIGINT, shuttind down server");
+            }
+        }
+
+        self.shutdown_and_wait().await;
     }
 
     fn start_shutdown(&self) {
@@ -482,7 +511,7 @@ mod tests {
         })
         .install_from_args();
 
-        let mut server = Server {
+        let server = Server {
             grpc_enabled: true,
             ..Default::default()
         };

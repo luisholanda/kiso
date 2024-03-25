@@ -1,0 +1,36 @@
+[package]
+name = "kiso"
+version = "0.0.0"
+authors = ["Luis Holanda <luiscmholanda@gmail.com>"]
+edition = "2021"
+description = "A foundation for gRPC services"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+axum.workspace = true
+backtrace.workspace = true
+bytes.workspace = true
+clap.workspace = true
+flume.workspace = true
+futures-util.workspace = true
+hickory-resolver.workspace = true
+http-body.workspace = true
+hyper.workspace = true
+nix.workspace = true
+num_cpus.workspace = true
+once_cell.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+signal-hook.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tonic.workspace = true
+tonic-health.workspace = true
+tower.workspace = true
+tower-http.workspace = true

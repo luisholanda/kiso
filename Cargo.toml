@@ -1,12 +1,10 @@
-[package]
-name = "kiso"
-version = "0.0.0"
-authors = ["Luis Holanda <luiscmholanda@gmail.com>"]
-edition = "2021"
-description = "A foundation for gRPC services"
-license = "MIT OR Apache-2.0"
+[workspace]
+members = ["examples/*", "kiso"]
+resolver = "2"
 
-[dependencies]
+[workspace.dependencies]
+kiso.path = "kiso"
+
 backtrace = "0.3.69"
 bytes = "1.5.0"
 clap = { version = "4.5.3", features = ["derive", "string"] }
@@ -27,28 +25,29 @@ serde_json = "1.0.114"
 signal-hook = "0.3.17"
 socket2 = { version = "0.5.5", features = ["all"] }
 tokio-rustls = "0.25.0"
+tonic-build.version = "0.11.0"
 tonic-health = { version = "0.11.0", default-features = false }
 
-[dependencies.axum]
+[workspace.dependencies.axum]
 version = "0.6.20"
 default-features = false
 features = ["matched-path", "tokio"]
 
-[dependencies.nix]
+[workspace.dependencies.nix]
 version = "0.27.1"
 features = ["pthread", "sched", "time"]
 
-[dependencies.tokio]
+[workspace.dependencies.tokio]
 version = "1.36.0"
 default-features = false
 features = ["full"]
 
-[dependencies.tonic]
+[workspace.dependencies.tonic]
 version = "0.11.0"
 default-features = false
 features = ["codegen", "prost", "gzip", "zstd", "transport", "tls-roots"]
 
-[dependencies.tower]
+[workspace.dependencies.tower]
 version = "0.4.13"
 default-features = false
 features = [
@@ -56,7 +55,7 @@ features = [
   "load-shed",
 ]
 
-[dependencies.tower-http]
+[workspace.dependencies.tower-http]
 version = "0.4.4"
 features = [
   "sensitive-headers",
@@ -67,14 +66,14 @@ features = [
   "timeout",
 ]
 
-[lints.rust]
+[workspace.lints.rust]
 rust_2018_idioms = "deny"
 
 let_underscore_drop = "warn"
 unused_imports = "warn"
 variant_size_differences = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 # Allows
 use_self = "allow"
 diverging_sub_expression = "allow"
@@ -84,7 +83,6 @@ extra_unused_lifetimes = "deny"
 mod_module_files = "deny"
 
 # Warns
-
 checked_conversions = "warn"
 cloned_instead_of_copied = "warn"
 cognitive_complexity = "warn"

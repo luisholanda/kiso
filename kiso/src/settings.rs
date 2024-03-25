@@ -83,6 +83,7 @@ impl Settings {
     fn builder(cmd_descriptor: CmdDescriptor) -> SettingsBuilder {
         SettingsBuilder {
             cmd: Command::new(cmd_descriptor.name).about(cmd_descriptor.about),
+            descriptor: cmd_descriptor,
         }
     }
 
@@ -101,6 +102,7 @@ impl Settings {
 /// A builder for [`Settings`].
 pub struct SettingsBuilder {
     cmd: Command,
+    descriptor: CmdDescriptor,
 }
 
 impl SettingsBuilder {
@@ -121,6 +123,11 @@ impl SettingsBuilder {
             .register::<crate::server::GrpcServiceSettings>()
             .register::<crate::clients::GrpcChannelSettings>()
             .register::<crate::observability::ObservabilitySettings>();
+
+        self.cmd = self
+            .cmd
+            .name(self.descriptor.name)
+            .about(self.descriptor.about);
 
         self.cmd.build();
 
