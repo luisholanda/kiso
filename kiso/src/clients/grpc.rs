@@ -73,8 +73,8 @@ impl GrpcChannel {
         // TODO: stop using tonic's default Channel.
         //
         // It doesn't allow us to implement all the features we want, specially load-based load balacing
-        // and service rediscovery on disconnects. It also handles timeouts too low in the stack, which
-        // can cause problems on high load.
+        // and service rediscovery on disconnects or reuse our HTTPS connector. It also handles timeouts
+        // too low in the stack, which can cause problems on high load.
         let (inner, tx) =
             Channel::balance_channel::<IpAddr>(opts.grpc_channel_load_balancing_initial_capacity);
         let default_deadline = opts.grpc_channel_default_deadline;

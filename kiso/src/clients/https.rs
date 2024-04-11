@@ -291,6 +291,9 @@ impl Default for HttpsConnector {
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
 
+            // FIXME: Make this runtime configurable.
+            config.resumption = rustls::client::Resumption::in_memory_sessions(512);
+
             config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
             Arc::new(config)
