@@ -96,9 +96,10 @@
           devShells.default = rustPkgs.workspaceShell {
             inherit (pre-commit) shellHook;
 
-            packages = [
-              pkgs.rust-bin.nightly.latest.rustfmt
-              pkgs.protobuf
+            packages = with pkgs; [
+              ghz
+              rust-bin.nightly.latest.rustfmt
+              protobuf
             ];
 
             RUSTC_FLAGS = rustcLinkFlags;

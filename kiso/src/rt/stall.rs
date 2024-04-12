@@ -1,9 +1,11 @@
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::{
     cell::Cell,
     future::Future,
     mem::MaybeUninit,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     time::{Duration, Instant},
@@ -27,6 +29,7 @@ use nix::sys::timerfd;
 ///
 /// Is safe to reenter this function: The detector knowns that it is armed and turn
 /// this call into an almost no-op.
+#[inline(always)]
 pub unsafe fn detect_stall<F, O>(func: F) -> O
 where
     F: FnOnce() -> O,
@@ -60,6 +63,7 @@ where
 ///
 /// Is safe to reenter this function: The detector knowns that it is armed and turn
 /// this call into an almost no-op.
+#[inline(always)]
 pub async unsafe fn detect_stall_on_poll<F>(fut: F) -> F::Output
 where
     F: Future,
@@ -71,19 +75,19 @@ where
 pub(super) struct LocalStallDetector {
     terminated: Arc<AtomicBool>,
     timer: Arc<timerfd::TimerFd>,
-    signal: Option<signal_hook::SigId>,
+    signal: signal_hook::SigId,
     stall_timeout: Duration,
     rx: Receiver<Frame>,
     armed: Cell<bool>,
+    #[cfg(test)]
     detections_count: Arc<AtomicU64>,
 }
 
 impl Drop for LocalStallDetector {
     fn drop(&mut self) {
-        self.terminated
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.terminated.store(true, Ordering::Release);
 
-        signal_hook::low_level::unregister(self.signal.take().unwrap());
+        signal_hook::low_level::unregister(self.signal);
 
         self.timer
             .set(
@@ -127,10 +131,11 @@ impl LocalStallDetector {
         Self::INSTANCE.set(MaybeUninit::new(Self {
             terminated,
             timer,
-            signal: Some(sig_id),
+            signal: sig_id,
             stall_timeout,
             rx,
             armed: Cell::new(false),
+            #[cfg(test)]
             detections_count: Arc::default(),
         }))
     }
@@ -206,12 +211,13 @@ impl Drop for StallGuard {
             frames.push(backtrace::BacktraceFrame::from(frame));
         }
 
-        let strace = backtrace::Backtrace::from(frames);
-
-        if strace.frames().is_empty() {
+        if frames.is_empty() {
             return;
         }
 
+        let strace = backtrace::Backtrace::from(frames);
+
+        #[cfg(test)]
         self.detector
             .detections_count
             .fetch_add(1, Ordering::Release);
