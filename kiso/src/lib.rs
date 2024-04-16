@@ -8,4 +8,4 @@ pub mod settings;
 
 pub mod observability;
 
-pub use self::rt::spawn;
+pub use self::{observability::tracing::Instrument, rt::spawn};

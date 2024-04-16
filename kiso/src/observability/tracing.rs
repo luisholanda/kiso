@@ -1,4 +1,4 @@
-use std::{borrow::Cow, str::FromStr, time::SystemTime};
+use std::{borrow::Cow, future::Future, str::FromStr, time::SystemTime};
 
 use opentelemetry::{
     trace::{Link, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState},
@@ -242,4 +242,25 @@ pub(super) struct NewSpan {
     pub(super) parent_id: SpanId,
     pub(super) start_time: SystemTime,
     pub(super) attributes: Vec<KeyValue>,
+}
+
+/// Helper trait for Future instrumentation.
+pub trait Instrument: Sized + Future {
+    /// Instrument the future with the given span.
+    fn instrument(self, span: Span) -> impl Future<Output = Self::Output> + Send;
+
+    /// Instrument the future with the current span.
+    fn in_current_span(self) -> impl Future<Output = Self::Output> + Send;
+}
+
+impl<F: Future + Send> Instrument for F {
+    #[inline(always)]
+    fn in_current_span(self) -> impl Future<Output = Self::Output> + Send {
+        self.instrument(Span::current())
+    }
+
+    #[inline(always)]
+    fn instrument(self, span: Span) -> impl Future<Output = Self::Output> + Send {
+        crate::context::scope(span, self)
+    }
 }
