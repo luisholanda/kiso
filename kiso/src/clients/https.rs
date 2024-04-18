@@ -10,7 +10,7 @@ use std::{
 
 use axum::{
     body::{BoxBody, HttpBody},
-    http::{header, HeaderMap, HeaderValue},
+    http::{header, request::Parts, HeaderMap, HeaderValue},
 };
 use bytes::{Buf, BufMut, BytesMut};
 use futures_util::future::BoxFuture;
@@ -425,55 +425,88 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, mut req: Request<B1>) -> Self::Future {
-        let mut builder = Span::builder(req.method().to_string(), SpanKind::Client);
+    fn call(&mut self, req: Request<B1>) -> Self::Future {
+        #[inline(never)]
+        fn build_span(parts: &mut Parts) -> Span {
+            let mut builder = Span::builder(parts.method.to_string(), SpanKind::Client);
 
-        builder = builder
-            .attr(trace::HTTP_REQUEST_METHOD, req.method().to_string())
-            .attr(trace::URL_FULL, req.uri().to_string());
+            builder = builder
+                .attr(trace::HTTP_REQUEST_METHOD, parts.method.to_string())
+                .attr(trace::URL_FULL, parts.uri.to_string());
 
-        if let Some(h) = req.uri().host() {
-            builder = builder.attr(trace::SERVER_ADDRESS, h.to_string());
-        }
-
-        'port: {
-            let p = if let Some(p) = req.uri().port_u16() {
-                p as i64
-            } else if req.uri().scheme_str() == Some("https") {
-                443
-            } else {
-                break 'port;
-            };
-
-            builder = builder.attr(trace::SERVER_PORT, p);
-        }
-
-        for (h, v) in req.headers() {
-            if v.is_sensitive() {
-                continue;
+            if let Some(h) = parts.uri.host() {
+                builder = builder.attr(trace::SERVER_ADDRESS, h.to_string());
             }
 
-            if let Ok(v) = v.to_str() {
-                builder = builder.attr(format!("http.request.header.{h}"), v.to_string());
+            'port: {
+                let p = if let Some(p) = parts.uri.port_u16() {
+                    p as i64
+                } else if parts.uri.scheme_str() == Some("https") {
+                    443
+                } else {
+                    break 'port;
+                };
+
+                builder = builder.attr(trace::SERVER_PORT, p);
+            }
+
+            for (h, v) in &parts.headers {
+                if v.is_sensitive() {
+                    continue;
+                }
+
+                if let Ok(v) = v.to_str() {
+                    builder = builder.attr(format!("http.request.header.{h}"), v.to_string());
+                }
+            }
+
+            let span = builder.start();
+
+            if let Ok(tracestate) =
+                HeaderValue::from_str(&span.span_context().trace_state().header())
+            {
+                parts.headers.insert("tracestate", tracestate);
+            }
+
+            let traceparent = format!(
+                "00-{}-{}-{:02x}",
+                span.span_context().trace_id(),
+                span.span_context().span_id(),
+                span.span_context().trace_flags() & TraceFlags::SAMPLED
+            );
+
+            if let Ok(traceparent) = HeaderValue::from_str(&traceparent) {
+                parts.headers.insert("traceparent", traceparent);
+            }
+
+            span
+        }
+
+        #[inline(never)]
+        fn after_response(span: Span, status: StatusCode, headers: &HeaderMap) {
+            if status.is_client_error() || status.is_server_error() {
+                // we can't get any meaningful description without reading the body.
+                span.set_status(Status::error(""));
+            }
+
+            span.set_attribute(trace::HTTP_RESPONSE_STATUS_CODE, status.as_u16() as i64);
+
+            for (h, v) in headers {
+                if v.is_sensitive() {
+                    continue;
+                }
+
+                if let Ok(v) = v.to_str() {
+                    span.set_attribute(format!("http.response.header.{h}"), v.to_string());
+                }
             }
         }
 
-        let span = builder.start();
+        let (mut parts, body) = req.into_parts();
 
-        if let Ok(tracestate) = HeaderValue::from_str(&span.span_context().trace_state().header()) {
-            req.headers_mut().insert("tracestate", tracestate);
-        }
+        let span = build_span(&mut parts);
 
-        let traceparent = format!(
-            "00-{}-{}-{:02x}",
-            span.span_context().trace_id(),
-            span.span_context().span_id(),
-            span.span_context().trace_flags() & TraceFlags::SAMPLED
-        );
-
-        if let Ok(traceparent) = HeaderValue::from_str(&traceparent) {
-            req.headers_mut().insert("traceparent", traceparent);
-        }
+        let req = Request::from_parts(parts, body);
 
         let fut = crate::context::scope_sync(span.clone(), || self.inner.call(req));
 
@@ -488,25 +521,7 @@ where
                 }
             };
 
-            if res.status().is_client_error() || res.status().is_server_error() {
-                // we can't get any meaningful description without reading the body.
-                span.set_status(Status::error(""));
-            }
-
-            span.set_attribute(
-                trace::HTTP_RESPONSE_STATUS_CODE,
-                res.status().as_u16() as i64,
-            );
-
-            for (h, v) in res.headers() {
-                if v.is_sensitive() {
-                    continue;
-                }
-
-                if let Ok(v) = v.to_str() {
-                    span.set_attribute(format!("http.response.header.{h}"), v.to_string());
-                }
-            }
+            after_response(span, res.status(), res.headers());
 
             Ok(res)
         }))
