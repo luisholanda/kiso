@@ -84,6 +84,16 @@ impl GrpcChannel {
             .map_response(|res: Response<LogMsgsBody<hyper::Body>>| res.map(TracedBody::new))
             .layer(https_settings.take_request_sensitive_headers_layer())
             .layer(https_settings.take_response_sensitive_headers_layer())
+            .layer_fn(|inner| super::retry::RetryService { inner })
+            .map_request(|req: Request<super::retry::UnsyncBoxBodyBoxError>| {
+                req.map(|b| {
+                    b.map_err(|err| match err.downcast::<tonic::Status>() {
+                        Ok(status) => *status,
+                        Err(err) => tonic::Status::internal(err.to_string()),
+                    })
+                    .boxed_unsync()
+                })
+            })
             .layer_fn(|inner| HttpTracingService { inner })
             .layer_fn(|inner| TracingService { inner })
             .map_request(move |mut req: Request<BoxBody>| {

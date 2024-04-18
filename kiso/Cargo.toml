@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 axum.workspace = true
+backoff.workspace = true
 backtrace.workspace = true
 bytes.workspace = true
 clap.workspace = true
@@ -22,6 +23,7 @@ once_cell.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-semantic-conventions.workspace = true
+parking_lot.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true

@@ -184,6 +184,7 @@ impl Client {
             .layer(settings.take_response_sensitive_headers_layer())
             .layer(DecompressionLayer::new())
             .map_response(|res: Response<Body>| res.map(TracedBody::new))
+            .layer_fn(|inner| super::retry::RetryService { inner })
             .layer_fn(|inner| TracingService { inner })
             .map_future(move |fut: ResponseFuture| async move {
                 let instant = if let Some(deadline) = crate::context::try_current::<Deadline>() {
