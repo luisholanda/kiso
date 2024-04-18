@@ -12,6 +12,9 @@ use self::body::ReplayBody;
 mod body;
 
 /// Settings for RPC retries.
+///
+/// This should be put in the extensions of the RPC requests that should be
+/// retried. No retry is done by default.
 #[derive(Clone, Copy)]
 pub struct RetrySettings {
     /// Initial interval to wait before retrying.
