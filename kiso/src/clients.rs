@@ -9,5 +9,6 @@ pub use self::{
     auth::{Authenticated, Authenticator, FixedToken, NoAuthentication},
     grpc::{GrpcChannel, GrpcChannelSettings},
     https::{Client as HttpsClient, HttpsClientSettings},
+    resolver::{resolve_uri, ServiceDiscoveryStream},
     retry::RetrySettings,
 };

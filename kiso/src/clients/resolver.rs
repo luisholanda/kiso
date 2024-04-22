@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tower::discover::Change;
 
 #[inline(always)]
-pub(super) async fn resolve_uri(uri: &Uri) -> Result<Vec<IpAddr>, ResolveError> {
+pub async fn resolve_uri(uri: &Uri) -> Result<Vec<IpAddr>, ResolveError> {
     RESOLVER.resolve_uri(uri).await
 }
 
