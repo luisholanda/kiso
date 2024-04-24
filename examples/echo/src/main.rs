@@ -80,7 +80,8 @@ fn main() {
     kiso::rt::block_on(async {
         kiso::observability::initialize(Exporters {
             log_exporter: opentelemetry_stdout::LogExporter::default(),
-            log_backtrace_printer: Box::new(|bc| format!("{bc:?}")),
+            log_backtrace_printer: Box::new(|bc| format!("{bc:?}").into()),
+            span_exporter: opentelemetry_sdk::testing::trace::NoopSpanExporter::new(),
         });
 
         let echo = echo_server::EchoServer::new(EchoServer);

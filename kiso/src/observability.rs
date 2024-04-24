@@ -3,10 +3,12 @@ use std::time::Duration;
 use backtrace::Backtrace;
 use flume::{Sender, TrySendError};
 use once_cell::sync::OnceCell;
+use opentelemetry::logs::AnyValue;
 use opentelemetry_sdk::{
-    export::logs::LogExporter,
-    logs::{BatchConfigBuilder, BatchLogProcessor},
+    export::{logs::LogExporter, trace::SpanExporter},
+    logs::{self, BatchLogProcessor},
     runtime::Tokio,
+    trace::{self, BatchSpanProcessor, SpanLimits},
 };
 
 use self::worker::{Command, Worker, WorkerConfig};
@@ -16,9 +18,14 @@ pub mod tracing;
 
 mod worker;
 
-pub struct Exporters<L> {
+/// Exporters used by the kiso's observability stack.
+pub struct Exporters<L, S> {
+    /// Exporter used for logs.
     pub log_exporter: L,
-    pub log_backtrace_printer: Box<dyn Fn(Backtrace) -> String + Send>,
+    /// How we should convert backtraces into OTel values.
+    pub log_backtrace_printer: Box<dyn Fn(Backtrace) -> AnyValue + Send>,
+    /// Exporter used for spans.
+    pub span_exporter: S,
 }
 
 /// Initializes kiso's observability stack.
@@ -26,19 +33,27 @@ pub struct Exporters<L> {
 /// # Panics
 ///
 /// Panics if called twice.
-pub fn initialize<L>(exporters: Exporters<L>)
+pub fn initialize<L, S>(exporters: Exporters<L, S>)
 where
     L: LogExporter + 'static,
+    S: SpanExporter + 'static,
 {
     assert!(CMD_SENDER.get().is_none());
 
     let settings: ObservabilitySettings = crate::settings::get();
 
-    let log_processor_config = BatchConfigBuilder::default()
+    let log_processor_config = logs::BatchConfigBuilder::default()
         .with_max_queue_size(settings.observability_logging_batch_max_queue_size)
         .with_scheduled_delay(settings.observability_logging_batch_scheduled_delay)
         .with_max_export_timeout(settings.observability_logging_batch_max_export_timeout)
         .with_max_export_batch_size(settings.observability_logging_batch_max_export_batch_size)
+        .build();
+
+    let span_processor_config = trace::BatchConfigBuilder::default()
+        .with_max_queue_size(settings.observability_span_batch_max_queue_size)
+        .with_scheduled_delay(settings.observability_span_batch_scheduled_delay)
+        .with_max_export_timeout(settings.observability_span_batch_max_export_timeout)
+        .with_max_export_batch_size(settings.observability_span_batch_max_export_batch_size)
         .build();
 
     let sender = Worker::spawn(WorkerConfig {
@@ -49,6 +64,10 @@ where
         cmd_channel_capacity: settings.observability_buffer_capacity,
         resource_detection_timeout: settings.observability_resource_detection_timeout,
         initial_spans_capacity: settings.observability_tracing_initial_spans_buffer_size,
+        span_limits: SpanLimits::default(),
+        span_processor: BatchSpanProcessor::builder(exporters.span_exporter, Tokio)
+            .with_batch_config(span_processor_config)
+            .build(),
     });
 
     CMD_SENDER
@@ -92,6 +111,25 @@ crate::settings!(pub(crate) ObservabilitySettings {
     ///
     /// Defaults to 2048.
     observability_tracing_initial_spans_buffer_size: usize = 2048,
+    /// The maximum logs waiting to be processed. New spans will be dropped if the batch
+    /// is full and `observability_span_batch_scheduled_delay` has not yet passed.
+    ///
+    /// Defaults to 2048.
+    observability_span_batch_max_queue_size: usize = 2048,
+    /// Interval between processing consecutive log batches.
+    ///
+    /// Defaults to 1s.
+    #[arg(value_parser = crate::settings::DurationParser)]
+    observability_span_batch_scheduled_delay: Duration = Duration::from_secs(1),
+    /// Timeout for the export of a single logs batch.
+    ///
+    /// Defaults to 30s.
+    #[arg(value_parser = crate::settings::DurationParser)]
+    observability_span_batch_max_export_timeout: Duration = Duration::from_secs(30),
+    /// Size of a single logs batch.
+    ///
+    /// Defaults to 512.
+    observability_span_batch_max_export_batch_size: usize = 512,
 });
 
 static CMD_SENDER: OnceCell<Sender<Command>> = OnceCell::new();

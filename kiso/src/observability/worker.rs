@@ -7,7 +7,7 @@ use std::{
 use backtrace::Backtrace;
 use flume::{Receiver, Sender};
 use opentelemetry::{
-    logs::{LogRecord, Severity},
+    logs::{AnyValue, LogRecord, Severity},
     trace::{Link, SpanId, Status, TraceId},
     InstrumentationLibrary, KeyValue,
 };
@@ -16,7 +16,7 @@ use opentelemetry_sdk::{
     logs::{BatchLogProcessor, LogProcessor},
     resource::*,
     runtime::Tokio,
-    trace::{SpanEvents, SpanLinks},
+    trace::{BatchSpanProcessor, SpanEvents, SpanLimits, SpanLinks, SpanProcessor},
     Resource,
 };
 use opentelemetry_semantic_conventions::trace;
@@ -46,7 +46,7 @@ impl Command {
                 },
                 _,
                 _,
-            ) => *n >= Severity::Info,
+            ) => *n > Severity::Info,
             _ => true,
         }
     }
@@ -57,18 +57,22 @@ pub(super) type LightSpanCtx = (TraceId, SpanId);
 pub(super) struct Worker {
     rx: Receiver<Command>,
     log_processor: BatchLogProcessor<Tokio>,
-    log_backtrace_printer: Box<dyn Fn(Backtrace) -> String>,
+    log_backtrace_printer: Box<dyn Fn(Backtrace) -> AnyValue>,
+    span_processor: BatchSpanProcessor<Tokio>,
     resource: &'static Resource,
     library: InstrumentationLibrary,
     spans: HashMap<LightSpanCtx, SpanData>,
+    span_limits: SpanLimits,
 }
 
 pub(super) struct WorkerConfig {
     pub(super) log_processor: BatchLogProcessor<Tokio>,
-    pub(super) log_backtrace_printer: Box<dyn Fn(Backtrace) -> String + Send>,
+    pub(super) log_backtrace_printer: Box<dyn Fn(Backtrace) -> AnyValue + Send>,
+    pub(super) span_processor: BatchSpanProcessor<Tokio>,
     pub(super) cmd_channel_capacity: usize,
     pub(super) resource_detection_timeout: Duration,
     pub(super) initial_spans_capacity: usize,
+    pub(super) span_limits: SpanLimits,
 }
 
 impl Worker {
@@ -88,9 +92,11 @@ impl Worker {
                 rx,
                 log_processor: config.log_processor,
                 log_backtrace_printer: config.log_backtrace_printer,
+                span_processor: config.span_processor,
                 resource,
                 library: instrumentation_library,
                 spans: HashMap::with_capacity(config.initial_spans_capacity),
+                span_limits: config.span_limits,
             };
 
             while let Ok(cmd) = worker.rx.recv() {
@@ -120,7 +126,7 @@ impl Worker {
                     log.attributes
                         .as_mut()
                         .unwrap()
-                        .push((trace::EXCEPTION_STACKTRACE.into(), bt.into()));
+                        .push((trace::EXCEPTION_STACKTRACE.into(), bt));
                 }
 
                 self.log_processor.emit(LogData {
@@ -129,8 +135,18 @@ impl Worker {
                     instrumentation: self.library.clone(),
                 });
             }
-            Command::NewSpan(ns) => {
+            Command::NewSpan(mut ns) => {
                 let light_span_ctx = (ns.span_context.trace_id(), ns.span_context.span_id());
+                let dropped_attributes_count = ns
+                    .attributes
+                    .len()
+                    .saturating_sub(self.span_limits.max_attributes_per_span as _)
+                    as u32;
+                if dropped_attributes_count > 0 {
+                    ns.attributes
+                        .truncate(self.span_limits.max_attributes_per_span as _);
+                }
+
                 self.spans.insert(
                     light_span_ctx,
                     SpanData {
@@ -143,7 +159,7 @@ impl Worker {
                         resource: Cow::Borrowed(self.resource),
                         instrumentation_lib: self.library.clone(),
                         attributes: ns.attributes,
-                        dropped_attributes_count: 0,
+                        dropped_attributes_count,
                         events: SpanEvents::default(),
                         links: SpanLinks::default(),
                         status: opentelemetry::trace::Status::Ok,
@@ -152,7 +168,12 @@ impl Worker {
             }
             Command::SetSpanAttr(span_ctx, attr) => {
                 if let Some(span) = self.spans.get_mut(&span_ctx) {
-                    span.attributes.push(attr);
+                    if span.attributes.len() == self.span_limits.max_attributes_per_span as usize {
+                        span.dropped_attributes_count =
+                            span.dropped_attributes_count.saturating_add(1);
+                    } else {
+                        span.attributes.push(attr);
+                    }
                 }
             }
             Command::SetSpanStatus(span_ctx, status) => {
@@ -167,13 +188,16 @@ impl Worker {
             }
             Command::AddLinkToSpan(span_ctx, link) => {
                 if let Some(span) = self.spans.get_mut(&span_ctx) {
+                    if span.links.len() >= self.span_limits.max_links_per_span as usize {
+                        span.links.dropped_count = span.links.dropped_count.saturating_add(1);
+                    }
                     span.links.links.push(link);
                 }
             }
             Command::EndSpan(span_ctx, end_ts) => {
-                if let Some(span) = self.spans.get_mut(&span_ctx) {
+                if let Some(mut span) = self.spans.remove(&span_ctx) {
                     span.end_time = end_ts;
-                    // TODO: dispatch to span processor.
+                    self.span_processor.on_end(span);
                 }
             }
         }
