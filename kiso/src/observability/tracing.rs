@@ -1,7 +1,8 @@
 use std::{borrow::Cow, future::Future, str::FromStr, time::SystemTime};
 
+pub use opentelemetry::trace::SpanKind;
 use opentelemetry::{
-    trace::{Link, SpanContext, SpanId, SpanKind, Status, TraceFlags, TraceId, TraceState},
+    trace::{Link, SpanContext, SpanId, Status, TraceFlags, TraceId, TraceState},
     Key, KeyValue, Value,
 };
 use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
@@ -53,6 +54,14 @@ impl Span {
             parent_id,
             attributes: Vec::with_capacity(8),
         }
+    }
+
+    /// Starts the construction of a new internal span.
+    ///
+    /// This is how most spans in an application should be created, as the other
+    /// kinds of span are mostly handled by libries.
+    pub fn internal(name: impl Into<Cow<'static, str>>) -> SpanBuilder {
+        Self::builder(name, SpanKind::Internal)
     }
 
     /// The OpenTelemetry span context of this span.

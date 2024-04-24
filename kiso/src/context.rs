@@ -150,6 +150,18 @@ macro_rules! impl_context_for_type {
             pub fn current() -> Self {
                 $crate::context::current::<Self>()
             }
+
+            /// Run the given future with this value in context.
+            #[inline(always)]
+            pub async fn in_scope<O>(self, fut: impl ::std::future::Future<Output = O>) -> O {
+                $crate::context::scope(self, fut).await
+            }
+
+            /// Run the given function with this value in context.
+            #[inline(always)]
+            pub fn in_scope_sync<O>(self, f: impl ::std::ops::FnOnce() -> O) -> O {
+                $crate::context::scope_sync(self, f)
+            }
         }
     };
 
