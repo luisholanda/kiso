@@ -33,7 +33,7 @@ use tokio::{
     net::TcpStream,
 };
 use tokio_rustls::{client::TlsStream, TlsConnector};
-use tower::{util::BoxCloneService, Service, ServiceExt};
+use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 use tower_http::{
     decompression::{DecompressionBody, DecompressionLayer},
     sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
@@ -50,7 +50,8 @@ pub type ClientBody = DecompressionBody<TracedBody<Body>>;
 /// like deadlines.
 #[derive(Clone)]
 pub struct Client {
-    inner: BoxCloneService<Request<BoxBody>, Response<ClientBody>, hyper::Error>,
+    inner:
+        Buffer<BoxService<Request<BoxBody>, Response<ClientBody>, hyper::Error>, Request<BoxBody>>,
 }
 
 impl Client {
@@ -69,7 +70,13 @@ impl Client {
     {
         let req = request.map(|b| b.map_err(axum::Error::new).boxed_unsync());
 
-        let res = self.inner.clone().oneshot(req).await?;
+        let res = match self.inner.clone().oneshot(req).await {
+            Ok(res) => res,
+            Err(err) => match err.downcast() {
+                Ok(err) => return Err(*err),
+                Err(err) => unreachable!("client closed unexpectedly: {err:?}"),
+            },
+        };
 
         Ok(res)
     }
@@ -119,12 +126,7 @@ impl Client {
             );
         }
 
-        let res = self
-            .inner
-            .clone()
-            .oneshot(req)
-            .await
-            .map_err(JsonApiError::Response)?;
+        let res = self.request(req).await.map_err(JsonApiError::Response)?;
 
         if res.status().is_client_error() {
             return Err(JsonApiError::Client(res));
@@ -178,8 +180,10 @@ impl Client {
             .http2_keep_alive_while_idle(settings.https_client_http2_keep_alive_while_idle)
             .build(HttpsConnector::default());
 
+        let deadline = crate::context::try_current::<Deadline>();
+
         let inner = tower::ServiceBuilder::new()
-            .boxed_clone()
+            .boxed()
             .layer(settings.take_request_sensitive_headers_layer())
             .layer(settings.take_response_sensitive_headers_layer())
             .layer(DecompressionLayer::new())
@@ -187,7 +191,7 @@ impl Client {
             .layer_fn(|inner| super::retry::RetryService { inner })
             .layer_fn(|inner| TracingService { inner })
             .map_future(move |fut: ResponseFuture| async move {
-                let instant = if let Some(deadline) = crate::context::try_current::<Deadline>() {
+                let instant = if let Some(deadline) = deadline {
                     deadline.instant()
                 } else {
                     Instant::now() + default_timeout
@@ -203,7 +207,9 @@ impl Client {
             })
             .service(client);
 
-        Self { inner }
+        Self {
+            inner: Buffer::new(inner, settings.https_client_requests_buffer_size),
+        }
     }
 }
 
@@ -236,6 +242,11 @@ crate::settings!(
         ///
         /// "Set-Cookie" is already marked as sensitive.
         https_client_extra_response_sensitive_headers: Vec<String>,
+        /// The size of the requests buffer.
+        ///
+        /// This should be set to at least the maximum number of concurrent requests
+        /// the client will see.
+        https_client_requests_buffer_size: usize = 1024,
     }
 );
 

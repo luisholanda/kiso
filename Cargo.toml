@@ -36,7 +36,7 @@ default-features = false
 features = ["matched-path", "tokio"]
 
 [workspace.dependencies.nix]
-version = "0.27.1"
+version = "0.28.0"
 features = ["pthread", "sched", "time"]
 
 [workspace.dependencies.tokio]
@@ -53,6 +53,7 @@ features = ["codegen", "prost", "gzip", "zstd", "transport", "tls-roots"]
 version = "0.4.13"
 default-features = false
 features = [
+  "buffer",
   "limit",
   "load-shed",
 ]
