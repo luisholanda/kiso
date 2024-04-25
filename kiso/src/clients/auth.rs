@@ -40,6 +40,16 @@ pub struct Authenticated<S, A> {
     ready_inner: Option<S>,
 }
 
+impl<S: Clone, A> Clone for Authenticated<S, A> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            authenticator: self.authenticator.clone(),
+            ready_inner: None,
+        }
+    }
+}
+
 impl<S, A> Authenticated<S, A> {
     /// Constructs a new authenticated service.
     pub fn new(service: S, authenticator: Arc<A>) -> Self {
