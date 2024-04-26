@@ -1,4 +1,5 @@
 use std::{
+    error::Error,
     future::Future,
     net::IpAddr,
     pin::Pin,
@@ -9,7 +10,7 @@ use std::{
 
 use axum::http::HeaderValue;
 use bytes::Buf;
-use futures_util::{future::BoxFuture, TryStreamExt};
+use futures_util::{future::BoxFuture, FutureExt, TryStreamExt};
 use hyper::{body::HttpBody, Request, Response};
 use opentelemetry::trace::Status;
 use opentelemetry_semantic_conventions::trace;
@@ -18,7 +19,7 @@ use tonic::{
     body::BoxBody,
     transport::{Channel, ClientTlsConfig, Endpoint, Uri},
 };
-use tower::{discover::Change, util::BoxCloneService, Service, ServiceBuilder};
+use tower::{buffer::Buffer, discover::Change, util::BoxService, Service, ServiceBuilder};
 
 use super::{
     https::{TracedBody, TracingService as HttpTracingService},
@@ -52,10 +53,14 @@ use crate::{clients::HttpsClientSettings, context::Deadline, observability::trac
 /// of message timings.
 #[derive(Clone)]
 pub struct GrpcChannel {
-    inner: BoxCloneService<
+    #[allow(clippy::type_complexity)]
+    inner: Buffer<
+        BoxService<
+            Request<BoxBody>,
+            Response<TracedBody<LogMsgsBody<hyper::Body>>>,
+            tonic::transport::Error,
+        >,
         Request<BoxBody>,
-        Response<TracedBody<LogMsgsBody<hyper::Body>>>,
-        tonic::transport::Error,
     >,
     // Will kill the background resolver task when the last channel is dropped.
     _resolver_task_aborter: Arc<Aborter>,
@@ -80,7 +85,7 @@ impl GrpcChannel {
         let default_deadline = opts.grpc_channel_default_deadline;
 
         let service = ServiceBuilder::new()
-            .boxed_clone()
+            .boxed()
             .map_response(|res: Response<LogMsgsBody<hyper::Body>>| res.map(TracedBody::new))
             .layer(https_settings.take_request_sensitive_headers_layer())
             .layer(https_settings.take_response_sensitive_headers_layer())
@@ -107,6 +112,8 @@ impl GrpcChannel {
                 req
             })
             .service(inner);
+
+        let service = Buffer::new(service, opts.grpc_channel_requests_buffer_size);
 
         let resolver = Box::new(BackgroundResolver {
             scheme: uri.scheme_str().unwrap_or("https").to_string(),
@@ -142,7 +149,7 @@ impl Drop for Aborter {
 
 impl Service<Request<BoxBody>> for GrpcChannel {
     type Response = Response<TracedBody<LogMsgsBody<hyper::Body>>>;
-    type Error = tonic::transport::Error;
+    type Error = Box<dyn Error + Send + Sync + 'static>;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -150,7 +157,7 @@ impl Service<Request<BoxBody>> for GrpcChannel {
     }
 
     fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
-        self.inner.call(req)
+        self.inner.call(req).boxed()
     }
 }
 
@@ -166,6 +173,11 @@ crate::settings!(pub GrpcChannelSettings {
     /// Default deadline for RPC calls when no deadline is available in the context.
     #[arg(value_parser = crate::settings::DurationParser)]
     grpc_channel_default_deadline: Duration = Duration::from_secs(10),
+    /// The size of the requests buffer.
+    ///
+    /// This should be set to at least the maximum number of concurrent requests
+    /// the channel will see.
+    grpc_channel_requests_buffer_size: usize = 1024,
 });
 
 struct BackgroundResolver {
