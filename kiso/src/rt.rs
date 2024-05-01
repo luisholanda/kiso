@@ -8,7 +8,6 @@ use std::{
     time::Duration,
 };
 
-use clap::{CommandFactory, FromArgMatches};
 use once_cell::sync::Lazy;
 use tokio::task::JoinHandle;
 
@@ -84,10 +83,7 @@ where
 }
 
 static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
-    let mut rt_settings = RuntimeSettings::default();
-    rt_settings
-        .update_from_arg_matches(&RuntimeSettings::command().get_matches())
-        .expect("bad runtime settings");
+    let rt_settings: RuntimeSettings = crate::settings::get();
 
     let mut builder = if rt_settings.runtime_single_cpu {
         tokio::runtime::Builder::new_current_thread()

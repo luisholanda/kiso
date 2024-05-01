@@ -22,7 +22,14 @@ pub fn builder(cmd_descriptor: CmdDescriptor) -> SettingsBuilder {
 /// from the command line arguments. In this case an error message will be
 /// printed informing the problem.
 pub fn get<T: SettingsFromArgs>() -> T {
-    SETTINGS.get().expect("Settings not installed").get()
+    if let Some(cfg) = SETTINGS.get() {
+        cfg.get()
+    } else {
+        let mut t = T::default();
+        t.update_from_arg_matches(&T::command().get_matches())
+            .unwrap();
+        t
+    }
 }
 
 /// Descriptor of the command being executed.
@@ -68,9 +75,15 @@ macro_rules! settings {
     };
 }
 
-pub trait SettingsFromArgs: Default + clap::FromArgMatches + clap::Args {}
+pub trait SettingsFromArgs:
+    Default + clap::FromArgMatches + clap::CommandFactory + clap::Args
+{
+}
 
-impl<T> SettingsFromArgs for T where T: Default + clap::FromArgMatches + clap::Args {}
+impl<T> SettingsFromArgs for T where
+    T: Default + clap::FromArgMatches + clap::CommandFactory + clap::Args
+{
+}
 
 /// Application settings.
 ///
@@ -122,6 +135,7 @@ impl SettingsBuilder {
             .register::<crate::server::ServerSettings>()
             .register::<crate::server::GrpcServiceSettings>()
             .register::<crate::clients::GrpcChannelSettings>()
+            .register::<crate::rt::RuntimeSettings>()
             .register::<crate::observability::ObservabilitySettings>();
 
         self.cmd = self
