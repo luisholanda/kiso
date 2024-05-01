@@ -131,7 +131,7 @@ impl<B> ReplayBody<B> {
                     trailers: None,
                     rest: body,
                     is_completed: false,
-                    max_remaining_bytes: max_bytes + 1,
+                    max_remaining_bytes: max_bytes.saturating_add(1),
                 })),
             }),
             state: None,
