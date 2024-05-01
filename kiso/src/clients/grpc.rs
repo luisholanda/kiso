@@ -236,7 +236,7 @@ impl BackgroundResolver {
 
 fn duration_to_grpc_timeout(dur: Duration) -> String {
     const MAX_ALLOWED_TIMEOUT: u128 = 10_000_000;
-    const SUFFIXES: &[&str] = &["ns", "us", "ms", "s"];
+    const SUFFIXES: &[&str] = &["n", "u", "m", "S"];
 
     let mut val = dur.as_nanos();
     let mut suf_idx = 0;
