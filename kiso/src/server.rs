@@ -519,10 +519,9 @@ mod tests {
         let shutdown = server.start().await;
 
         let mut client = tonic_health::pb::health_client::HealthClient::new(
-            tonic::transport::Channel::builder("http://localhost:8080".parse().unwrap())
-                .connect()
-                .await
-                .expect("failed to connect to server"),
+            crate::clients::GrpcChannel::with_default_settings(
+                &"http://localhost:8080".parse().unwrap(),
+            ),
         );
 
         let resp = client

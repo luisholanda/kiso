@@ -44,13 +44,19 @@ impl NameResolver {
             panic!("tried to resolve URI without host: {uri}");
         };
 
-        match self.resolver.srv_lookup(host).await {
-            Ok(srv_lookup) => Ok(srv_lookup.ip_iter().collect()),
-            Err(err) if matches!(err.kind(), ResolveErrorKind::NoRecordsFound { .. }) => {
-                let ips = self.resolver.lookup_ip(host).await?;
-                Ok(ips.into_iter().collect())
-            }
-            Err(err) => Err(err),
+        loop {
+            return match self.resolver.srv_lookup(host).await {
+                Ok(srv_lookup) => Ok(srv_lookup.ip_iter().collect()),
+                Err(err) if matches!(err.kind(), ResolveErrorKind::NoRecordsFound { .. }) => {
+                    let ips = self.resolver.lookup_ip(host).await?;
+                    Ok(ips.into_iter().collect())
+                }
+                Err(err) if transient_error(&err) => {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                Err(err) => Err(err),
+            };
         }
     }
 }
@@ -58,7 +64,7 @@ impl NameResolver {
 /// A stream for continuous service discovery of an URI.
 pub struct ServiceDiscoveryStream {
     host: String,
-    task: JoinHandle<Result<(), ResolveError>>,
+    task: Option<JoinHandle<Result<(), ResolveError>>>,
     tx: flume::Sender<Change<IpAddr, ()>>,
     rx: flume::r#async::RecvStream<'static, Change<IpAddr, ()>>,
 }
@@ -76,7 +82,10 @@ impl ServiceDiscoveryStream {
             host: host.to_string(),
             rx: rx.into_stream(),
             tx: tx.clone(),
-            task: crate::rt::spawn(BackgroundDiscoverer::start(host.to_string(), tx)),
+            task: Some(crate::rt::spawn(BackgroundDiscoverer::start(
+                host.to_string(),
+                tx,
+            ))),
         }
     }
 
@@ -87,7 +96,9 @@ impl ServiceDiscoveryStream {
 
 impl Drop for ServiceDiscoveryStream {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -97,22 +108,30 @@ impl Stream for ServiceDiscoveryStream {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if let Poll::Ready(res) = this.task.poll_unpin(cx) {
-            match res {
-                Ok(Ok(())) => unreachable!("discovery task finished with an open receiver"),
-                Ok(Err(err)) => return Poll::Ready(Some(Err(err))),
-                Err(err) if err.is_panic() => {
-                    crate::error!("discovery task panicked");
-                    this.task = crate::spawn(BackgroundDiscoverer::start(
-                        this.host.clone(),
-                        this.tx.clone(),
-                    ));
+        if let Some(task) = &mut this.task {
+            if let Poll::Ready(res) = task.poll_unpin(cx) {
+                match res {
+                    // Resolver finished, continue polling from the channel.
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Poll::Ready(Some(Err(err))),
+                    Err(err) if err.is_panic() => {
+                        crate::error!("discovery task panicked");
+                        *task = crate::spawn(BackgroundDiscoverer::start(
+                            this.host.clone(),
+                            this.tx.clone(),
+                        ));
+                    }
+                    Err(_) => unreachable!("discovery task cancelled"),
                 }
-                Err(_) => unreachable!("discovery task cancelled"),
+
+                this.task = None;
             }
         }
 
-        this.rx.poll_next_unpin(cx).map(|o| o.map(Ok))
+        match this.rx.poll_next_unpin(cx).map(|o| o.map(Ok)) {
+            Poll::Pending if this.task.is_none() => Poll::Ready(None),
+            res => res,
+        }
     }
 }
 
@@ -143,6 +162,19 @@ impl BackgroundDiscoverer {
 
 impl BackgroundDiscoverer {
     async fn run(&mut self) -> Result<(), ResolveError> {
+        if self.host == "localhost" {
+            let _ = self.tx.send(Change::Insert(
+                IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                (),
+            ));
+            return Ok(());
+        }
+
+        if let Ok(ip) = self.host.parse::<IpAddr>() {
+            let _ = self.tx.send(Change::Insert(ip, ()));
+            return Ok(());
+        }
+
         while !self.tx.is_disconnected() {
             let res = match self.resolver.srv_lookup(&self.host).await {
                 Ok(srv_lookup) => {
@@ -221,5 +253,62 @@ fn transient_error(error: &ResolveError) -> bool {
                 | ProtoErrorKind::Timeout
         ),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use futures_util::TryStreamExt;
+
+    use super::*;
+
+    static ONE_ONE_ONE_ONE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1));
+    static ONE_ZERO_ZERO_ONE: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 1));
+
+    #[tokio::test]
+    async fn test_resolve_uri() {
+        let cloudflare_dns = Uri::from_static("https://one.one.one.one");
+
+        let ips = resolve_uri(&cloudflare_dns).await.unwrap();
+
+        assert!(ips.contains(&ONE_ONE_ONE_ONE));
+        assert!(ips.contains(&ONE_ZERO_ZERO_ONE));
+    }
+
+    #[tokio::test]
+    async fn test_service_discovery_stream() {
+        let cloudflare_dns = Uri::from_static("https://one.one.one.one");
+
+        let ips: Vec<_> = ServiceDiscoveryStream::start(&cloudflare_dns)
+            .take(2)
+            .try_collect()
+            .await
+            .unwrap();
+
+        for ip in ips {
+            if let Change::Insert(ip, _) = ip {
+                if ip != ONE_ONE_ONE_ONE && ip != ONE_ZERO_ZERO_ONE {
+                    panic!("unknown cloudflare DNS ip: {ip}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_service_discovery_stream_loopback() {
+        let localhost = Uri::from_static("http://localhost");
+
+        let ips: Vec<_> = ServiceDiscoveryStream::start(&localhost)
+            .try_collect()
+            .await
+            .unwrap();
+
+        for ip in ips {
+            if let Change::Insert(ip, _) = ip {
+                assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+            }
+        }
     }
 }

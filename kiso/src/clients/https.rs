@@ -180,8 +180,6 @@ impl Client {
             .http2_keep_alive_while_idle(settings.https_client_http2_keep_alive_while_idle)
             .build(HttpsConnector::default());
 
-        let deadline = crate::context::try_current::<Deadline>();
-
         let inner = tower::ServiceBuilder::new()
             .boxed()
             .layer(settings.take_request_sensitive_headers_layer())
@@ -190,19 +188,22 @@ impl Client {
             .map_response(|res: Response<Body>| res.map(TracedBody::new))
             .layer_fn(|inner| super::retry::RetryService { inner })
             .layer_fn(|inner| TracingService { inner })
-            .map_future(move |fut: ResponseFuture| async move {
-                let instant = if let Some(deadline) = deadline {
-                    deadline.instant()
-                } else {
-                    Instant::now() + default_timeout
-                };
+            .map_future(move |fut: ResponseFuture| {
+                let deadline = crate::context::try_current::<Deadline>();
+                async move {
+                    let instant = if let Some(deadline) = deadline {
+                        deadline.instant()
+                    } else {
+                        Instant::now() + default_timeout
+                    };
 
-                if let Ok(res) = tokio::time::timeout_at(instant.into(), fut).await {
-                    res
-                } else {
-                    let mut resp = Response::new(Body::empty());
-                    *resp.status_mut() = StatusCode::REQUEST_TIMEOUT;
-                    Ok(resp)
+                    if let Ok(res) = tokio::time::timeout_at(instant.into(), fut).await {
+                        res
+                    } else {
+                        let mut resp = Response::new(Body::empty());
+                        *resp.status_mut() = StatusCode::REQUEST_TIMEOUT;
+                        Ok(resp)
+                    }
                 }
             })
             .service(client);
@@ -591,6 +592,11 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, Self::Error>> {
         let this = unsafe { self.get_unchecked_mut() };
+        this.span
+            .set_attribute(trace::HTTP_RESPONSE_BODY_SIZE, this.body_size);
+        this.span
+            .set_attribute("http.response.body.data_frames", this.data_frames);
+
         match unsafe { std::task::ready!(Pin::new_unchecked(&mut this.body).poll_trailers(cx)) } {
             Ok(trailers) => {
                 if let Some(t) = &trailers {
@@ -605,11 +611,6 @@ where
                         }
                     }
                 }
-
-                this.span
-                    .set_attribute(trace::HTTP_RESPONSE_BODY_SIZE, this.body_size);
-                this.span
-                    .set_attribute("http.response.body.data_frames", this.data_frames);
 
                 Poll::Ready(Ok(trailers))
             }
@@ -627,5 +628,26 @@ where
 
     fn size_hint(&self) -> SizeHint {
         self.body.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_request() {
+        let client = Client::default();
+
+        let res = client
+            .request(
+                Request::get("https://one.one.one.one")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("failed request");
+
+        assert_eq!(res.status(), StatusCode::OK);
     }
 }

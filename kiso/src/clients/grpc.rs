@@ -201,7 +201,7 @@ impl BackgroundResolver {
                 Ok(Some(Change::Remove(ip))) => {
                     drop(self.tx.send(Change::Remove(ip)).await);
                 }
-                Ok(None) => unreachable!("discovery stream never finishes"),
+                Ok(None) => return,
                 Err(err) => {
                     crate::error!("resolve failure in service discovery: {err:?}");
                     return;
@@ -218,13 +218,19 @@ impl BackgroundResolver {
             .build()
             .expect("failed to build endpoint URI");
 
-        Channel::builder(uri)
+        let endpoint = Channel::builder(uri)
             .http2_adaptive_window(self.https_settings.https_client_http2_use_adaptive_window)
             .http2_keep_alive_interval(self.https_settings.https_client_http2_keep_alive_interval)
             .buffer_size(self.grpc_settings.grpc_channel_buffer_size)
-            .tcp_nodelay(true)
-            .tls_config(ClientTlsConfig::new().domain_name(self.discovery_stream.host()))
-            .expect("failed to build endpoint")
+            .tcp_nodelay(true);
+
+        if self.scheme == "https" {
+            endpoint
+                .tls_config(ClientTlsConfig::new().domain_name(self.discovery_stream.host()))
+                .expect("failed to build endpoint")
+        } else {
+            endpoint
+        }
     }
 }
 
@@ -359,5 +365,13 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<hyper::HeaderMap>, Self::Error>> {
         unsafe { self.map_unchecked_mut(|b| &mut b.body) }.poll_trailers(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
     }
 }
