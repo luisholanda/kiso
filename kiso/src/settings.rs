@@ -2,7 +2,9 @@ use core::panic;
 use std::{ffi::OsStr, marker::PhantomData, time::Duration};
 
 #[doc(hidden)]
-pub use clap::Parser as __Parser;
+pub mod __private {
+    pub use clap;
+}
 use clap::{builder::TypedValueParser, Command};
 use once_cell::sync::OnceCell;
 
@@ -47,25 +49,30 @@ pub struct CmdDescriptor {
 #[macro_export]
 macro_rules! settings {
     ($(#[$ty_meta: meta])* $vis: vis $ty_name: ident { $($(#[$meta: meta])+ $setting: ident : $ty: ty $(= $default: expr)? ,)+ }) => {
-        $(#[$ty_meta])*
-        #[derive($crate::settings::__Parser)]
-        $vis struct $ty_name {
-            $(
-                $(#[$meta])+
-                #[arg(long, required(false))]
-                $vis $setting: $ty,
-            )+
-        }
+        mod __settings {
+            use super::*;
+            use $crate::settings::__private::clap;
+            $(#[$ty_meta])*
+            #[derive(clap::Parser)]
+            $vis struct $ty_name {
+                $(
+                    $(#[$meta])+
+                    #[arg(long, required(false))]
+                    $vis $setting: $ty,
+                )+
+            }
 
-        impl ::std::default::Default for $ty_name {
-            fn default() -> Self {
-                Self {
-                    $(
-                        $setting: $crate::settings!(__or_default $($default)?),
-                    )+
+            impl ::std::default::Default for $ty_name {
+                fn default() -> Self {
+                    Self {
+                        $(
+                            $setting: $crate::settings!(__or_default $($default)?),
+                        )+
+                    }
                 }
             }
         }
+        $vis use __settings::$ty_name;
     };
     (__or_default $default: expr) => {
         $default

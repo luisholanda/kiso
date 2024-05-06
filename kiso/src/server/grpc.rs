@@ -14,6 +14,50 @@ use tower::{util::BoxCloneService, Service, ServiceBuilder};
 
 use crate::context::Deadline;
 
+crate::settings! {
+    pub(crate) GrpcServiceSettings {
+        /// The default deadline for gRPC services.
+        ///
+        /// Defaults to 30 seconds.
+        ///
+        /// This can be overwritten per-service using `grpc-service-deadline`.
+        #[arg(value_parser = crate::settings::DurationParser)]
+        grpc_default_deadline: Duration = Duration::from_secs(30),
+        /// The default body limit for gRPC services.
+        ///
+        /// Defaults to 30Kib.
+        ///
+        /// This can be overwritten per-service using `grpc-service-body-limit`.
+        #[arg(value_parser = crate::settings::SizeParser)]
+        grpc_default_body_limit: usize = 30 * 1024,
+        /// The default maximum number of inflight requests that each service supports.
+        ///
+        /// Defaults to no limit.
+        ///
+        /// This can be overwritten per-service using `grpc-service-concurrency`.
+        ///
+        /// # Note
+        ///
+        /// Currently, when this limit is reached, any further requests are cancelled.
+        grpc_default_concurrency: u32 = u32::MAX,
+        /// The deadline for individual gRPC services.
+        ///
+        /// This should be `<service name>=<deadline>`.
+        #[arg(value_parser = crate::settings::KeyValueParser::<crate::settings::DurationParser>::default())]
+        grpc_service_deadline: Vec<(String, Duration)>,
+        /// The request body limit for individual gRPC services.
+        ///
+        /// This should be `<service name>=<limit>`.
+        #[arg(long, value_parser = crate::settings::KeyValueParser::<crate::settings::SizeParser>::default())]
+        grpc_service_body_limit: Vec<(String, usize)>,
+        /// The concurrency limit for in-flight requests for individual gRPC services.
+        ///
+        /// This should be `<service name>=<concurrency>`.
+        #[arg(long, value_parser = crate::settings::KeyValueParser::<clap::builder::RangedI64ValueParser<u32>>::default())]
+        grpc_service_concurrency: Vec<(String, u32)>,
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct GrpcService {
     inner: BoxCloneService<Request<Body>, Response<BoxBody>, Box<dyn Error + Send + Sync>>,
