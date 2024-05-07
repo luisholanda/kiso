@@ -25,7 +25,6 @@ use hyper::{
     Body, Request, Response, StatusCode, Uri,
 };
 use once_cell::sync::Lazy;
-use opentelemetry::trace::{SpanKind, Status, TraceFlags};
 use opentelemetry_semantic_conventions::trace;
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use tokio::{
@@ -39,7 +38,10 @@ use tower_http::{
     sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
 };
 
-use crate::{context::Deadline, observability::tracing::Span};
+use crate::{
+    context::Deadline,
+    observability::tracing::{Span, SpanKind, Status},
+};
 
 pub type ClientBody = DecompressionBody<TracedBody<Body>>;
 
@@ -480,12 +482,7 @@ where
                 parts.headers.insert("tracestate", tracestate);
             }
 
-            let traceparent = format!(
-                "00-{}-{}-{:02x}",
-                span.span_context().trace_id(),
-                span.span_context().span_id(),
-                span.span_context().trace_flags() & TraceFlags::SAMPLED
-            );
+            let traceparent = span.to_w3c_traceparent();
 
             if let Ok(traceparent) = HeaderValue::from_str(&traceparent) {
                 parts.headers.insert("traceparent", traceparent);

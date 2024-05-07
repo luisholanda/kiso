@@ -1,8 +1,8 @@
 use std::{borrow::Cow, future::Future, str::FromStr, time::SystemTime};
 
-pub use opentelemetry::trace::SpanKind;
+pub use opentelemetry::trace::{Link, SpanKind, Status};
 use opentelemetry::{
-    trace::{Link, SpanContext, SpanId, Status, TraceFlags, TraceId, TraceState},
+    trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState},
     Key, KeyValue, Value,
 };
 use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
@@ -105,6 +105,16 @@ impl Span {
     /// A link marks a relationship between this span and another one.
     pub fn add_link(&self, link: Link) {
         super::send_cmd(Command::AddLinkToSpan(self.light_id(), link));
+    }
+
+    /// Encode this span as a W3C trace parent header value.
+    pub fn to_w3c_traceparent(&self) -> String {
+        format!(
+            "00-{}-{}-{:02x}",
+            self.ctx.trace_id(),
+            self.ctx.span_id(),
+            self.ctx.trace_flags() & TraceFlags::SAMPLED
+        )
     }
 
     fn light_id(&self) -> LightSpanCtx {
