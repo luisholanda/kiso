@@ -11,6 +11,7 @@ use std::{
 use once_cell::sync::Lazy;
 use tokio::task::JoinHandle;
 
+#[cfg(target_os = "linux")]
 mod stall;
 
 crate::settings!(pub(crate) RuntimeSettings {
@@ -79,7 +80,13 @@ where
     F::Output: Send,
 {
     // SAFETY: RUNTIME already takes care of initializing the stall detector.
-    RUNTIME.spawn(unsafe { self::stall::detect_stall_on_poll(fut) })
+    #[cfg(target_os = "linux")]
+    {
+        RUNTIME.spawn(unsafe { self::stall::detect_stall_on_poll(fut) })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    RUNTIME.spawn(fut)
 }
 
 static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
@@ -105,6 +112,7 @@ static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
         .expect("failed to start tokio runtime")
 });
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn runtime_thread_start(settings: &RuntimeSettings) -> impl Fn() + Send + Sync + 'static {
     let ncpus = num_cpus::get();
     let mut indexes = Vec::with_capacity(settings.runtime_pinned_threads_per_core * ncpus);
@@ -123,6 +131,7 @@ fn runtime_thread_start(settings: &RuntimeSettings) -> impl Fn() + Send + Sync +
         if pin_threads {
             let idx = count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
 
+            #[cfg(target_os = "linux")]
             if idx < indexes.len() {
                 let cpu = indexes[idx];
 
@@ -135,6 +144,7 @@ fn runtime_thread_start(settings: &RuntimeSettings) -> impl Fn() + Send + Sync +
 
         // SAFETY: the thread was just initialized, register was never called.
         unsafe {
+            #[cfg(target_os = "linux")]
             self::stall::LocalStallDetector::register(stall_budget, stall_max_frames);
         }
     }
@@ -144,6 +154,7 @@ fn runtime_thread_stop(_: &RuntimeSettings) -> impl Fn() + Send + Sync + 'static
     move || {
         // SAFETY: register was called during thread start.
         unsafe {
+            #[cfg(target_os = "linux")]
             self::stall::LocalStallDetector::unregister();
         }
     }

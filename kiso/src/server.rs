@@ -263,10 +263,11 @@ async fn start_server_listener(
 
         let socket = socket2::Socket::new(
             addr.domain(),
-            socket2::Type::STREAM.nonblocking(),
+            socket2::Type::STREAM,
             Some(socket2::Protocol::TCP),
         )?;
 
+        socket.set_nonblocking(true)?;
         socket.set_nodelay(true)?;
         socket.set_reuse_address(true)?;
         socket.set_reuse_port(true)?;
