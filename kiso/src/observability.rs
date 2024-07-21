@@ -62,7 +62,6 @@ where
             .build(),
         log_backtrace_printer: exporters.log_backtrace_printer,
         cmd_channel_capacity: settings.observability_buffer_capacity,
-        resource_detection_timeout: settings.observability_resource_detection_timeout,
         initial_spans_capacity: settings.observability_tracing_initial_spans_buffer_size,
         span_limits: SpanLimits::default(),
         span_processor: BatchSpanProcessor::builder(exporters.span_exporter, Tokio)
@@ -83,11 +82,6 @@ crate::settings!(pub(crate) ObservabilitySettings {
     /// Note that, if the buffer is full, some low priority commands may be lost, like `DEBUG`
     /// logs.
     observability_buffer_capacity: usize = 128 * 1024 / std::mem::size_of::<Command>(),
-    /// Timeout for the background worker to detect all the resource information.
-    ///
-    /// Defaults to 5s.
-    #[arg(value_parser = crate::settings::DurationParser)]
-    observability_resource_detection_timeout: Duration = Duration::from_secs(5),
     /// The maximum logs waiting to be processed. New logs will be dropped if the batch
     /// is full and `observability_logging_batch_scheduled_delay` has not yet passed.
     ///

@@ -5,10 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{body::BoxBody, extract::DefaultBodyLimit, http};
+use axum::{body::Body, extract::DefaultBodyLimit, http};
 use futures_util::{future::BoxFuture, Future, FutureExt as _, TryFutureExt as _};
-use http_body::Body as _;
-use hyper::{Body, Request, Response};
+use hyper::{Request, Response};
 use tonic::{body::BoxBody as TonicBoxBody, Code};
 use tower::{util::BoxCloneService, Service, ServiceBuilder};
 
@@ -60,7 +59,7 @@ crate::settings! {
 
 #[derive(Clone)]
 pub(super) struct GrpcService {
-    inner: BoxCloneService<Request<Body>, Response<BoxBody>, Box<dyn Error + Send + Sync>>,
+    inner: BoxCloneService<Request<Body>, Response<Body>, Box<dyn Error + Send + Sync>>,
     default_deadline: Duration,
     overloaded: bool,
 }
@@ -89,9 +88,7 @@ impl GrpcService {
                 }
             })
             .map_future(catch_panic)
-            .map_response(|res: Response<TonicBoxBody>| {
-                res.map(|b| b.map_err(axum::Error::new).boxed_unsync())
-            })
+            .map_response(|res: Response<TonicBoxBody>| res.map(Body::new))
             .load_shed()
             .concurrency_limit(config.request_concurrency_limit as usize)
             .layer(DefaultBodyLimit::max(config.body_limit))
@@ -111,7 +108,7 @@ impl GrpcService {
 }
 
 impl Service<Request<Body>> for GrpcService {
-    type Response = Response<BoxBody>;
+    type Response = Response<Body>;
     type Error = Infallible;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -156,9 +153,9 @@ impl Service<Request<Body>> for GrpcService {
 }
 
 #[inline(always)]
-async fn catch_panic<F, E>(fut: F) -> Result<Response<BoxBody>, E>
+async fn catch_panic<F, E>(fut: F) -> Result<Response<Body>, E>
 where
-    F: Future<Output = Result<Response<BoxBody>, E>>,
+    F: Future<Output = Result<Response<Body>, E>>,
 {
     AssertUnwindSafe(fut)
         .catch_unwind()
@@ -187,15 +184,11 @@ fn get_grpc_timeout(req: &Request<Body>) -> Option<Duration> {
     None
 }
 
-fn error_response(code: Code) -> Response<BoxBody> {
+fn error_response(code: Code) -> Response<Body> {
     Response::builder()
         .status(http::StatusCode::OK)
         .header("grpc-status", code as i32)
         .header(axum::http::header::CONTENT_TYPE, "application/grpc")
-        .body(
-            hyper::Body::empty()
-                .map_err(axum::Error::new)
-                .boxed_unsync(),
-        )
+        .body(Body::empty())
         .unwrap()
 }

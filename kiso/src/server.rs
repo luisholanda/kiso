@@ -6,21 +6,16 @@ use std::{
     time::Duration,
 };
 
-use axum::response::IntoResponse;
+use axum::{body::Body, extract::connect_info::Connected, response::IntoResponse};
 use clap::builder::TypedValueParser;
-use http_body::combinators::UnsyncBoxBody;
-use hyper::{
-    body::Bytes,
-    header,
-    server::conn::{AddrIncoming, AddrStream},
-    Body, Request, Response, StatusCode,
-};
+use http_body_util::combinators::UnsyncBoxBody;
+use hyper::{body::Bytes, header, Request, Response, StatusCode};
 use tokio::{
     net::TcpListener,
     signal::unix::SignalKind,
     sync::{Notify, Semaphore},
-    task::JoinHandle,
 };
+use tokio_util::task::TaskTracker;
 use tonic::server::NamedService;
 use tower::{limit::GlobalConcurrencyLimitLayer, Service};
 use tower_http::{
@@ -28,11 +23,12 @@ use tower_http::{
     sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
 };
 
-use self::{grpc::ServiceConfiguration, observability::Addrs};
+use self::{grpc::ServiceConfiguration, listener::Addrs};
 use crate::server::grpc::GrpcService;
 pub(crate) use crate::server::grpc::GrpcServiceSettings;
 
 mod grpc;
+mod listener;
 mod observability;
 
 /// A gRPC/HTTP server, preconfigured for production workloads.
@@ -47,7 +43,7 @@ mod observability;
 /// - Graceful shutdown support.
 /// - Multiple acceptors for better connection establishment latency.
 /// - Mark certain request and response headers as sensitive.
-/// - Observability traces and metrics (TODO for metris).
+/// - Observability traces and metrics (TODO for metrics).
 pub struct Server {
     router: axum::Router,
     settings: ServerSettings,
@@ -144,7 +140,7 @@ impl Server {
             axum::routing::get(|| std::future::ready(StatusCode::OK)),
         );
 
-        crate::debug!("Server settings: {:?}", self.settings);
+        crate::debug!("Server settings: {:#?}", self.settings);
 
         crate::info!(
             "Starting server tasks, {} will be created",
@@ -154,18 +150,14 @@ impl Server {
         let notify = Arc::new(Notify::new());
         let service = self.make_service();
 
-        let mut server_tasks = Vec::with_capacity(self.settings.server_acceptor_tasks_count as _);
+        let server_tasks = TaskTracker::new();
         for _ in 0..self.settings.server_acceptor_tasks_count {
-            let task = start_server_listener(
-                service.clone(),
-                notify.clone(),
-                &self.settings,
-                self.grpc_enabled,
-            )
-            .await;
+            let listener = create_server_listener(service.clone(), notify.clone(), &self.settings);
 
-            server_tasks.push(task);
+            server_tasks.spawn(listener.run());
         }
+
+        server_tasks.close();
 
         crate::info!(
             "Server started! Listening on {}:{}",
@@ -211,12 +203,11 @@ impl Server {
             .router
             .clone()
             .route_layer(stack)
-            .into_make_service_with_connect_info::<Addrs>();
+            .into_make_service_with_connect_info();
 
         let conn_limit = Arc::new(Semaphore::new(self.settings.server_connection_limit));
 
         tower::ServiceBuilder::new()
-            .load_shed()
             .layer(GlobalConcurrencyLimitLayer::with_semaphore(conn_limit))
             .service(MakeConnectionService {
                 inner: axum_service,
@@ -252,12 +243,11 @@ impl Server {
     }
 }
 
-async fn start_server_listener(
+fn create_server_listener(
     service: ServerService,
     notify: Arc<Notify>,
     settings: &ServerSettings,
-    grpc_enabled: bool,
-) -> JoinHandle<()> {
+) -> self::listener::Listener {
     let try_listen = |sock_addr: SocketAddr| {
         let addr: socket2::SockAddr = sock_addr.into();
 
@@ -288,26 +278,17 @@ async fn start_server_listener(
     let listener = try_listen(sock_addr)
         .unwrap_or_else(|err| panic!("failed to bind to {sock_addr}: {err:?}"));
 
-    let addr_incoming =
-        AddrIncoming::from_listener(listener).expect("failed to configure listener");
-
-    let server = hyper::Server::builder(addr_incoming)
-        .http2_only(grpc_enabled || settings.server_http2_only)
-        .http2_adaptive_window(settings.server_http2_adaptive_flow_control)
-        .http2_keep_alive_interval(Some(settings.server_http2_keep_alive_interval))
-        .executor(KisoExecutor)
-        .serve(service)
-        .with_graceful_shutdown(async move { notify.notified().await });
-
-    tokio::spawn(async move {
-        if let Err(err) = server.await {
-            crate::error!("Server killed unexpectedly: {err}");
-        }
-    })
+    self::listener::Listener {
+        listener,
+        http2_adaptive_flow_control: settings.server_http2_adaptive_flow_control,
+        http2_keep_alive_interval: settings.server_http2_keep_alive_interval,
+        service,
+        notify,
+        default_local_addr: sock_addr,
+    }
 }
 
-type ServerService =
-    tower::load_shed::LoadShed<tower::limit::ConcurrencyLimit<MakeConnectionService>>;
+type ServerService = tower::limit::ConcurrencyLimit<MakeConnectionService>;
 
 type AxumMakeRouterService =
     axum::extract::connect_info::IntoMakeServiceWithConnectInfo<axum::Router, Addrs>;
@@ -317,28 +298,33 @@ struct MakeConnectionService {
     inner: AxumMakeRouterService,
 }
 
-impl<'a> Service<&'a AddrStream> for MakeConnectionService {
-    type Response = <AxumMakeRouterService as Service<&'a AddrStream>>::Response;
-    type Error = <AxumMakeRouterService as Service<&'a AddrStream>>::Error;
-    type Future = <AxumMakeRouterService as Service<&'a AddrStream>>::Future;
+impl<T: Copy> Service<T> for MakeConnectionService
+where
+    AxumMakeRouterService: Service<T>,
+    Addrs: Connected<T>,
+{
+    type Response = <AxumMakeRouterService as Service<T>>::Response;
+    type Error = <AxumMakeRouterService as Service<T>>::Error;
+    type Future = <AxumMakeRouterService as Service<T>>::Future;
 
     fn poll_ready(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        <AxumMakeRouterService as Service<&'a AddrStream>>::poll_ready(&mut self.inner, cx)
+        <AxumMakeRouterService as Service<T>>::poll_ready(&mut self.inner, cx)
     }
 
-    fn call(&mut self, stream: &'_ AddrStream) -> Self::Future {
+    fn call(&mut self, stream: T) -> Self::Future {
+        let addrs = Addrs::connect_info(stream);
         crate::debug!(
             "New connection accepted: {}:{} -> {}:{}",
-            stream.remote_addr().ip(),
-            stream.remote_addr().port(),
-            stream.local_addr().ip(),
-            stream.local_addr().port()
+            addrs.peer.ip(),
+            addrs.peer.port(),
+            addrs.local.ip(),
+            addrs.local.port()
         )
-        .attr("peer_ip", stream.remote_addr().ip().to_string())
-        .attr("peer_port", stream.remote_addr().port());
+        .attr("peer_ip", addrs.peer.ip().to_string())
+        .attr("peer_port", addrs.peer.port());
 
         self.inner.call(stream)
     }
@@ -346,7 +332,7 @@ impl<'a> Service<&'a AddrStream> for MakeConnectionService {
 
 pub struct Shutdown {
     notify: Arc<Notify>,
-    server_tasks: Vec<JoinHandle<()>>,
+    server_tasks: TaskTracker,
 }
 
 impl Shutdown {
@@ -356,7 +342,7 @@ impl Shutdown {
 
     pub async fn shutdown_and_wait(self) {
         self.start_shutdown();
-        futures_util::future::join_all(self.server_tasks).await;
+        self.server_tasks.wait().await;
     }
 
     pub async fn wait_for_shutdown_signals(self) {
@@ -429,13 +415,6 @@ crate::settings! {
         server_connection_limit: usize = Semaphore::MAX_PERMITS,
         /// Route to use for HTTP health checking.
         server_http_health_checking_route: String = "/health".to_string(),
-        /// If the server should require HTTP/2 connections.
-        ///
-        /// Note that gRPC requires HTTP/2, thus, adding any gRPC service to the server
-        /// will override this value.
-        ///
-        /// Defaults to false.
-        server_http2_only: bool,
         /// If the server should use HTTP/2 adaptive flow control via BDP.
         ///
         /// Defaults to true.

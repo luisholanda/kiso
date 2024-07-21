@@ -3,8 +3,8 @@ use std::{error::Error, time::Duration};
 use backoff::backoff::Backoff;
 use bytes::Bytes;
 use futures_util::future::{BoxFuture, Either};
-use http_body::combinators::UnsyncBoxBody;
-use hyper::{body::HttpBody, http};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt};
+use hyper::{body::Body as HttpBody, http};
 use tower::ServiceExt;
 
 use self::body::ReplayBody;

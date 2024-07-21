@@ -1,23 +1,17 @@
-use std::{
-    borrow::Cow,
-    collections::HashMap,
-    time::{Duration, SystemTime},
-};
+use std::{borrow::Cow, collections::HashMap, time::SystemTime};
 
 use backtrace::Backtrace;
 use flume::{Receiver, Sender};
 use opentelemetry::{
-    logs::{AnyValue, LogRecord, Severity},
+    logs::{AnyValue, Severity},
     trace::{Link, SpanId, Status, TraceId},
     InstrumentationLibrary, KeyValue,
 };
 use opentelemetry_sdk::{
     export::{logs::LogData, trace::SpanData},
-    logs::{BatchLogProcessor, LogProcessor},
-    resource::*,
+    logs::{BatchLogProcessor, LogProcessor, LogRecord},
     runtime::Tokio,
     trace::{BatchSpanProcessor, SpanEvents, SpanLimits, SpanLinks, SpanProcessor},
-    Resource,
 };
 use opentelemetry_semantic_conventions::trace;
 
@@ -59,7 +53,6 @@ pub(super) struct Worker {
     log_processor: BatchLogProcessor<Tokio>,
     log_backtrace_printer: Box<dyn Fn(Backtrace) -> AnyValue>,
     span_processor: BatchSpanProcessor<Tokio>,
-    resource: &'static Resource,
     library: InstrumentationLibrary,
     spans: HashMap<LightSpanCtx, SpanData>,
     span_limits: SpanLimits,
@@ -70,7 +63,6 @@ pub(super) struct WorkerConfig {
     pub(super) log_backtrace_printer: Box<dyn Fn(Backtrace) -> AnyValue + Send>,
     pub(super) span_processor: BatchSpanProcessor<Tokio>,
     pub(super) cmd_channel_capacity: usize,
-    pub(super) resource_detection_timeout: Duration,
     pub(super) initial_spans_capacity: usize,
     pub(super) span_limits: SpanLimits,
 }
@@ -80,20 +72,16 @@ impl Worker {
         let (tx, rx) = flume::bounded(config.cmd_channel_capacity);
 
         tokio::task::spawn_blocking(move || {
-            let resource = detect_resource(config.resource_detection_timeout);
-            let instrumentation_library = InstrumentationLibrary::new(
-                env!("CARGO_PKG_NAME"),
-                Some(env!("CARGO_PKG_VERSION")),
-                Some("https://opentelemetry.io/schemas/1.17.0"),
-                None,
-            );
+            let instrumentation_library = InstrumentationLibrary::builder(env!("CARGO_PKG_NAME"))
+                .with_version(env!("CARGO_PKG_VERSION"))
+                .with_schema_url("https://opentelemetry.io/schemas/1.35.0")
+                .build();
 
             let mut worker = Worker {
                 rx,
                 log_processor: config.log_processor,
                 log_backtrace_printer: config.log_backtrace_printer,
                 span_processor: config.span_processor,
-                resource,
                 library: instrumentation_library,
                 spans: HashMap::with_capacity(config.initial_spans_capacity),
                 span_limits: config.span_limits,
@@ -129,9 +117,8 @@ impl Worker {
                         .push((trace::EXCEPTION_STACKTRACE.into(), bt));
                 }
 
-                self.log_processor.emit(LogData {
+                self.log_processor.emit(&mut LogData {
                     record: log,
-                    resource: Cow::Borrowed(self.resource),
                     instrumentation: self.library.clone(),
                 });
             }
@@ -156,7 +143,6 @@ impl Worker {
                         name: ns.name,
                         start_time: ns.start_time,
                         end_time: ns.start_time,
-                        resource: Cow::Borrowed(self.resource),
                         instrumentation_lib: self.library.clone(),
                         attributes: ns.attributes,
                         dropped_attributes_count,
@@ -202,19 +188,4 @@ impl Worker {
             }
         }
     }
-}
-
-fn detect_resource(timeout: Duration) -> &'static Resource {
-    let resource = Resource::from_detectors(
-        timeout,
-        vec![
-            Box::new(EnvResourceDetector::new()),
-            Box::new(OsResourceDetector),
-            Box::new(ProcessResourceDetector),
-            Box::new(SdkProvidedResourceDetector),
-            Box::new(TelemetryResourceDetector),
-        ],
-    );
-
-    Box::leak(Box::new(resource))
 }

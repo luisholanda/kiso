@@ -9,7 +9,7 @@ use std::{
 
 use bytes::{Buf, Bytes};
 use http_body::{Body, SizeHint};
-use hyper::http::HeaderMap;
+use hyper::{body::Frame, http::HeaderMap};
 use parking_lot::Mutex;
 use tonic::Status;
 
@@ -184,10 +184,10 @@ where
     type Data = Bytes;
     type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-    fn poll_data(
+    fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = unsafe { self.get_unchecked_mut() };
         let state = Self::acquire_state(&mut this.state, &this.shared.body);
 
@@ -200,7 +200,7 @@ where
                 let chunk = state.buf.bufs[this.next_buf_idx].clone();
                 this.next_buf_idx += 1;
 
-                return Poll::Ready(Some(Ok(chunk)));
+                return Poll::Ready(Some(Ok(Frame::data(chunk))));
             }
 
             if state.is_capped() {
@@ -209,6 +209,13 @@ where
                 return Poll::Ready(Some(Err(Box::new(Status::aborted(
                     "cannot replay buffered body",
                 )))));
+            }
+        }
+
+        if this.replay_trailers {
+            this.replay_trailers = false;
+            if let Some(ref trailers) = state.trailers {
+                return Poll::Ready(Some(Ok(Frame::trailers(trailers.clone()))));
             }
         }
 
@@ -225,10 +232,10 @@ where
         // Poll the inner body for more data. If the body has ended, remember
         // that so that future clones will not try polling it again (as
         // described above).
-        let data = match futures_util::ready!(unsafe {
-            Pin::new_unchecked(&mut state.rest).poll_data(cx)
+        let mut frame = match futures_util::ready!(unsafe {
+            Pin::new_unchecked(&mut state.rest).poll_frame(cx)
         }) {
-            Some(Ok(data)) => data,
+            Some(Ok(frame)) => frame,
             Some(Err(e)) => return Poll::Ready(Some(Err(Box::new(e)))),
             None => {
                 state.is_completed = true;
@@ -236,61 +243,34 @@ where
             }
         };
 
-        let length = data.remaining();
-        state.max_remaining_bytes = state.max_remaining_bytes.saturating_sub(length);
-        let chunk = if state.is_capped() {
-            if !state.buf.bufs.is_empty() {
-                crate::debug!("Buffered maximum capacity, discarding buffer");
-                state.buf = Default::default();
-            }
-
-            data.slice(..length)
-        } else {
-            state.buf.push_chunk(data)
-        };
-
-        Poll::Ready(Some(Ok(chunk)))
-    }
-
-    fn poll_trailers(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<HeaderMap>, Self::Error>> {
-        let this = unsafe { self.get_unchecked_mut() };
-        let state = Self::acquire_state(&mut this.state, &this.shared.body);
-
-        if this.replay_trailers {
-            this.replay_trailers = false;
-            if let Some(ref trailers) = state.trailers {
-                return Poll::Ready(Ok(Some(trailers.clone())));
-            }
-        }
-
-        // If the inner body has previously ended, don't poll it again.
-        if state.rest.is_end_stream() {
-            Poll::Ready(Ok(None))
-        } else {
-            let res = futures_util::ready!(unsafe {
-                Pin::new_unchecked(&mut state.rest).poll_trailers(cx)
-            });
-            match res {
-                Ok(tlrs) => {
-                    if state.trailers.is_none() {
-                        state.trailers = tlrs.clone();
-                    }
-
-                    Poll::Ready(Ok(tlrs))
+        if let Some(data) = frame.data_ref() {
+            let length = data.remaining();
+            state.max_remaining_bytes = state.max_remaining_bytes.saturating_sub(length);
+            let chunk = if state.is_capped() {
+                if !state.buf.bufs.is_empty() {
+                    crate::debug!("Buffered maximum capacity, discarding buffer");
+                    state.buf = Default::default();
                 }
-                Err(e) => Poll::Ready(Err(Box::new(e))),
+
+                data.slice(..length)
+            } else {
+                state.buf.push_chunk(data.clone())
+            };
+
+            frame = frame.map_data(|_| chunk);
+        } else if let Some(trailers) = frame.trailers_ref() {
+            if state.trailers.is_none() {
+                state.trailers = Some(trailers.clone());
             }
         }
+
+        Poll::Ready(Some(Ok(frame)))
     }
 
     fn is_end_stream(&self) -> bool {
-        let is_inner_eos = self
-            .state
-            .as_ref()
-            .map_or(false, |state| state.rest.is_end_stream());
+        let is_inner_eos = self.state.as_ref().map_or(false, |state| {
+            state.is_completed || state.rest.is_end_stream()
+        });
 
         // if this body has data or trailers remaining to play back, it
         // is not EOS
@@ -339,6 +319,7 @@ impl BufList {
 
 #[cfg(test)]
 mod tests {
+    use http_body_util::BodyExt;
     use tonic::body::BoxBody;
 
     use super::*;
@@ -393,20 +374,16 @@ mod tests {
         tx.send_data("hello world").await;
         drop(tx);
 
-        while initial.data().await.is_some() {
-            // do nothing
+        while let Some(frame) = initial.frame().await {
+            assert!(frame.is_ok(), "frames should not error: {frame:?}");
         }
-        let initial_tlrs = initial.trailers().await.expect("trailers should not error");
-        assert_eq!(initial_tlrs.as_ref(), None);
 
         // drop the initial body to send the data to the replay
         drop(initial);
 
-        while replay.data().await.is_some() {
+        while replay.frame().await.is_some() {
             // do nothing
         }
-        let replay_tlrs = replay.trailers().await.expect("trailers should not error");
-        assert_eq!(replay_tlrs.as_ref(), None);
     }
 
     #[tokio::test]
@@ -419,16 +396,12 @@ mod tests {
 
         drop(tx);
 
-        assert!(initial.data().await.is_none(), "no data in body");
-        let initial_tlrs = initial.trailers().await.expect("trailers should not error");
-        assert_eq!(initial_tlrs.as_ref(), None);
+        assert!(initial.frame().await.is_none());
 
         // drop the initial body to send the data to the replay
         drop(initial);
 
-        assert!(replay.data().await.is_none(), "no data in body");
-        let replay_tlrs = replay.trailers().await.expect("trailers should not error");
-        assert_eq!(replay_tlrs.as_ref(), None);
+        assert!(replay.frame().await.is_none(), "no data in body");
     }
 
     #[tokio::test]
@@ -475,9 +448,7 @@ mod tests {
         });
 
         assert_eq!(body_to_string(&mut initial).await, "hello world");
-
-        let initial_tlrs = initial.trailers().await.expect("trailers should not error");
-        assert_eq!(initial_tlrs.as_ref(), None);
+        assert!(initial.frame().await.is_none());
 
         // drop the initial body to send the data to the replay
         drop(initial);
@@ -485,16 +456,13 @@ mod tests {
         let mut replay2 = replay.clone();
         assert_eq!(body_to_string(&mut replay).await, "hello world");
 
-        let replay_tlrs = replay.trailers().await.expect("trailers should not error");
-        assert_eq!(replay_tlrs.as_ref(), None);
+        assert!(replay.frame().await.is_none());
 
-        // drop the initial body to send the data to the replay
         drop(replay);
 
         assert_eq!(body_to_string(&mut replay2).await, "hello world");
 
-        let replay2_tlrs = replay2.trailers().await.expect("trailers should not error");
-        assert_eq!(replay2_tlrs.as_ref(), None);
+        assert!(replay2.frame().await.is_none());
     }
 
     #[tokio::test]
@@ -532,8 +500,7 @@ mod tests {
             "hello world, have lots of fun!"
         );
 
-        let replay2_tlrs = replay2.trailers().await.expect("trailers should not error");
-        assert_eq!(replay2_tlrs.as_ref(), None);
+        assert!(replay2.frame().await.is_none());
     }
 
     #[tokio::test]
@@ -550,9 +517,7 @@ mod tests {
         });
 
         assert_eq!(body_to_string(&mut initial).await, "hello world");
-
-        let initial_tlrs = initial.trailers().await.expect("trailers should not error");
-        assert_eq!(initial_tlrs.as_ref(), None);
+        assert!(initial.frame().await.is_none());
 
         // drop the initial body to send the data to the replay
         drop(initial);
@@ -562,27 +527,23 @@ mod tests {
         drop(replay2);
 
         assert_eq!(body_to_string(&mut replay).await, "hello world");
-        let replay_tlrs = replay.trailers().await.expect("trailers should not error");
-        assert_eq!(replay_tlrs.as_ref(), None);
+        assert!(replay.frame().await.is_none());
     }
 
     #[tokio::test]
     async fn eos_only_when_fully_replayed() {
         // Test that each clone of a body is not EOS until the data has been
         // fully replayed.
-        let mut initial = ReplayBody::new(
-            BoxBody::new(
-                http_body::Full::from("hello world")
-                    .map_err(|err| Status::internal(err.to_string())),
-            ),
-            64 * 1024,
-        );
-        let mut replay = initial.clone();
+        let Test {
+            mut initial,
+            mut replay,
+            ..
+        } = Test::new();
 
         body_to_string(&mut initial).await;
         assert!(!replay.is_end_stream());
 
-        initial.trailers().await.expect("trailers should not error");
+        assert!(initial.frame().await.is_none());
         assert!(initial.is_end_stream());
         assert!(!replay.is_end_stream());
 
@@ -592,9 +553,8 @@ mod tests {
         assert!(!replay.is_end_stream());
 
         body_to_string(&mut replay).await;
-        assert!(!replay.is_end_stream());
 
-        replay.trailers().await.expect("trailers should not error");
+        assert!(replay.frame().await.is_none());
         assert!(replay.is_end_stream());
 
         // Even if we clone a body _after_ it has been driven to EOS, the clone
@@ -606,27 +566,25 @@ mod tests {
         drop(replay);
 
         body_to_string(&mut replay2).await;
-        assert!(!replay2.is_end_stream());
 
-        replay2.trailers().await.expect("trailers should not error");
+        assert!(replay2.frame().await.is_none());
         assert!(replay2.is_end_stream());
     }
 
     #[tokio::test]
     async fn caps_buffer() {
-        let (mut tx, body) = tonic::transport::Body::channel();
-        let mut initial = ReplayBody::new(
-            BoxBody::new(body.map_err(|err| Status::internal(err.to_string()))),
-            8,
-        );
-        let mut replay = initial.clone();
+        let Test {
+            mut tx,
+            mut initial,
+            mut replay,
+        } = Test::with_cap(8);
 
         // Send enough data to reach the cap
-        tx.send_data(Bytes::from("aaaaaaaa")).await.unwrap();
+        tx.send_data(Bytes::from("aaaaaaaa")).await;
         assert_eq!(chunk(&mut initial).await, Some("aaaaaaaa".to_string()));
 
         // Further chunks are still forwarded on the initial body
-        tx.send_data(Bytes::from("bbbbbbbb")).await.unwrap();
+        tx.send_data(Bytes::from("bbbbbbbb")).await;
         assert_eq!(chunk(&mut initial).await, Some("bbbbbbbb".to_string()));
 
         drop(initial);
@@ -634,7 +592,7 @@ mod tests {
         // The request's replay should error, since we discarded the buffer when
         // we hit the cap.
         let _res = replay
-            .data()
+            .frame()
             .await
             .expect("replay must yield Some(Err(..)) when capped")
             .expect_err("replay must error when capped");
@@ -642,15 +600,14 @@ mod tests {
 
     #[tokio::test]
     async fn caps_across_replays() {
-        let (mut tx, body) = tonic::transport::Body::channel();
-        let mut initial = ReplayBody::new(
-            BoxBody::new(body.map_err(|err| Status::internal(err.to_string()))),
-            8,
-        );
-        let mut replay = initial.clone();
+        let Test {
+            mut tx,
+            mut initial,
+            mut replay,
+        } = Test::with_cap(8);
 
         // Send enough data to reach the cap
-        tx.send_data(Bytes::from("aaaaaaaa")).await.unwrap();
+        tx.send_data(Bytes::from("aaaaaaaa")).await;
         assert_eq!(chunk(&mut initial).await, Some("aaaaaaaa".to_string()));
         drop(initial);
 
@@ -658,14 +615,14 @@ mod tests {
 
         // The replay will reach the cap, but it should still return data from
         // the original body.
-        tx.send_data(Bytes::from("bbbbbbbb")).await.unwrap();
+        tx.send_data(Bytes::from("bbbbbbbb")).await;
         assert_eq!(chunk(&mut replay).await, Some("aaaaaaaa".to_string()));
         assert_eq!(chunk(&mut replay).await, Some("bbbbbbbb".to_string()));
         drop(replay);
 
         // The second replay will fail, though, because the buffer was discarded.
         let _res = replay2
-            .data()
+            .frame()
             .await
             .expect("replay must yield Some(Err(..)) when capped")
             .expect_err("replay must error when capped");
@@ -677,14 +634,20 @@ mod tests {
         replay: ReplayBody<BoxBody>,
     }
 
-    struct Tx(hyper::body::Sender);
+    struct Tx(flume::Sender<Result<bytes::Bytes, std::convert::Infallible>>);
 
     impl Test {
         fn new() -> Self {
-            let (tx, body) = tonic::transport::Body::channel();
+            Self::with_cap(64 * 1024)
+        }
+
+        fn with_cap(cap: usize) -> Self {
+            let (tx, rx) = flume::unbounded();
             let initial = ReplayBody::new(
-                BoxBody::new(body.map_err(|err| Status::internal(err.to_string()))),
-                64 * 1024,
+                axum::body::Body::from_stream(rx.into_stream())
+                    .map_err(|err| Status::internal(err.to_string()))
+                    .boxed_unsync(),
+                cap,
             );
             let replay = initial.clone();
             Self {
@@ -698,7 +661,10 @@ mod tests {
     impl Tx {
         async fn send_data(&mut self, data: impl Into<Bytes> + std::fmt::Debug) {
             let data = data.into();
-            self.0.send_data(data).await.expect("rx is not dropped");
+            self.0
+                .send_async(Ok(data))
+                .await
+                .expect("rx is not dropped");
         }
     }
 
@@ -706,9 +672,10 @@ mod tests {
     where
         T: http_body::Body + Unpin,
     {
-        body.data()
+        body.frame()
             .await
             .map(|res| res.map_err(|_| ()).unwrap())
+            .and_then(|f| f.into_data().ok())
             .map(string)
     }
 

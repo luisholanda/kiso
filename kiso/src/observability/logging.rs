@@ -3,19 +3,24 @@ use std::time::SystemTime;
 use backtrace::Backtrace;
 pub use opentelemetry::logs::Severity;
 use opentelemetry::{
-    logs::{AnyValue, LogRecordBuilder},
+    logs::{AnyValue, LogRecord as _},
     Key,
 };
+use opentelemetry_sdk::logs::LogRecord;
 
 #[doc(hidden)]
 #[inline(always)]
 pub fn log(level: Severity, body: AnyValue, loc: SourceLocation) -> LogBuilder {
     LogBuilder {
-        log: LogRecordBuilder::new()
-            .with_timestamp(SystemTime::now())
-            .with_severity_number(level)
-            .with_severity_text(level.name())
-            .with_body(body),
+        log: {
+            let mut log = LogRecord::default();
+            log.set_timestamp(SystemTime::now());
+            log.set_severity_number(level);
+            log.set_severity_text(std::borrow::Cow::Borrowed(level.name()));
+            log.set_body(body);
+
+            log
+        },
         location: loc,
         backtrace: None,
     }
@@ -27,7 +32,7 @@ pub fn log(level: Severity, body: AnyValue, loc: SourceLocation) -> LogBuilder {
 pub struct LogBuilder {
     // We don't expose the LogRecordBuilder directly so that the internal representation
     // is kept hidden, allowing us to optimize the hot path.
-    log: LogRecordBuilder,
+    log: LogRecord,
     // store the location instead of settings the attributes directly to prevent allocating
     // the attribute vector in the common case where no attributes are set.
     location: SourceLocation,
@@ -45,7 +50,7 @@ impl LogBuilder {
         K: Into<Key>,
         V: Into<AnyValue>,
     {
-        self.log = std::mem::take(&mut self.log).with_attribute(key, value);
+        self.log.add_attribute(key, value);
         self
     }
 
@@ -64,10 +69,8 @@ impl LogBuilder {
 
 impl Drop for LogBuilder {
     fn drop(&mut self) {
-        let record = std::mem::take(&mut self.log).build();
-
         super::send_cmd(super::worker::Command::EmitLog(
-            record,
+            std::mem::take(&mut self.log),
             std::mem::take(&mut self.location),
             self.backtrace.take(),
         ));

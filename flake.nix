@@ -34,7 +34,7 @@
             ];
           };
 
-          rustVersion = "1.77.0";
+          rustVersion = "1.79.0";
 
           rustcLinkFlags = [
             "-C linker=${pkgs.clang}/bin/clang"

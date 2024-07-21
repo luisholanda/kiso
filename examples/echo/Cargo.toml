@@ -9,9 +9,9 @@ edition = "2021"
 backtrace.workspace = true
 futures-util.workspace = true
 kiso.workspace = true
-prost.version = "0.12.0"
-opentelemetry_sdk = { workspace = true, features = ["testing"] }
-opentelemetry-stdout = { version = "0.3.0", features = ["logs"] }
+prost.version = "0.13.1"
+opentelemetry_sdk.workspace = true
+opentelemetry-stdout = { version = "0.5.0", features = ["logs"] }
 tonic.workspace = true
 
 [build-dependencies]

@@ -9,28 +9,26 @@ use std::{
 };
 
 use axum::{
-    body::{BoxBody, HttpBody},
+    body::{Body, HttpBody},
     http::{header, request::Parts, HeaderMap, HeaderValue},
 };
 use bytes::{Buf, BufMut, BytesMut};
 use futures_util::future::BoxFuture;
 use hickory_resolver::error::ResolveError;
 use http_body::SizeHint;
-use hyper::{
-    body::Bytes,
-    client::{
+use http_body_util::BodyExt;
+use hyper::{body::Bytes, Request, Response, StatusCode, Uri};
+use hyper_util::{
+    client::legacy::{
         connect::{Connected, Connection},
-        ResponseFuture,
+        Client as HyperClient, ResponseFuture,
     },
-    Body, Request, Response, StatusCode, Uri,
+    rt::{TokioIo, TokioTimer},
 };
 use once_cell::sync::Lazy;
-use opentelemetry_semantic_conventions::trace;
+use opentelemetry_semantic_conventions::{attribute, trace};
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::TcpStream,
-};
+use tokio::net::TcpStream;
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use tower::{buffer::Buffer, util::BoxService, Service, ServiceExt};
 use tower_http::{
@@ -52,8 +50,10 @@ pub type ClientBody = DecompressionBody<TracedBody<Body>>;
 /// like deadlines.
 #[derive(Clone)]
 pub struct Client {
-    inner:
-        Buffer<BoxService<Request<BoxBody>, Response<ClientBody>, hyper::Error>, Request<BoxBody>>,
+    inner: Buffer<
+        BoxService<Request<Body>, Response<ClientBody>, hyper_util::client::legacy::Error>,
+        Request<Body>,
+    >,
 }
 
 impl Client {
@@ -70,7 +70,7 @@ impl Client {
         B: HttpBody<Data = Bytes> + Send + 'static,
         B::Error: Error + Send + Sync + 'static,
     {
-        let req = request.map(|b| b.map_err(axum::Error::new).boxed_unsync());
+        let req = request.map(|b| Body::new(b.map_err(axum::Error::new)));
 
         let res = match self.inner.clone().oneshot(req).await {
             Ok(res) => res,
@@ -102,24 +102,26 @@ impl Client {
 
         let req = req.map(|_| {
             #[allow(unreachable_code)]
-            http_body::Full::new(writer.into_inner().freeze())
-                .map_err(|_| unreachable!() as axum::Error)
-                .boxed_unsync()
+            let full = http_body_util::Full::new(writer.into_inner().freeze())
+                .map_err(|_| unreachable!() as axum::Error);
+            Body::new(full)
         });
 
         let res = self.do_json_api_request(req).await?;
 
-        let body = hyper::body::aggregate(res.into_body())
+        let body = res
+            .into_body()
+            .collect()
             .await
             .map_err(JsonApiError::ResponseBody)?;
 
-        serde_json::from_reader(body.reader()).map_err(JsonApiError::Deserialization)
+        serde_json::from_reader(body.aggregate().reader()).map_err(JsonApiError::Deserialization)
     }
 
     #[inline(never)]
     async fn do_json_api_request(
         &self,
-        mut req: Request<BoxBody>,
+        mut req: Request<Body>,
     ) -> Result<Response<ClientBody>, JsonApiError> {
         if !req.headers().contains_key(header::CONTENT_TYPE) {
             req.headers_mut().append(
@@ -131,10 +133,8 @@ impl Client {
         let res = self.request(req).await.map_err(JsonApiError::Response)?;
 
         if res.status().is_client_error() {
-            return Err(JsonApiError::Client(res));
-        }
-
-        if res.status().is_server_error() {
+            Err(JsonApiError::Client(res))
+        } else if res.status().is_server_error() {
             Err(JsonApiError::Server(res))
         } else {
             Ok(res)
@@ -175,11 +175,13 @@ impl Client {
     pub fn new(mut settings: HttpsClientSettings) -> Self {
         let default_timeout = settings.https_client_default_timeout;
 
-        let client = hyper::Client::builder()
+        let client = HyperClient::builder(hyper_util::rt::TokioExecutor::new())
             .pool_max_idle_per_host(settings.https_client_max_idle_connections_per_host)
             .http2_adaptive_window(settings.https_client_http2_use_adaptive_window)
             .http2_keep_alive_interval(settings.https_client_http2_keep_alive_interval)
             .http2_keep_alive_while_idle(settings.https_client_http2_keep_alive_while_idle)
+            .timer(TokioTimer::new())
+            .pool_timer(TokioTimer::new())
             .build(HttpsConnector::default());
 
         let inner = tower::ServiceBuilder::new()
@@ -200,7 +202,7 @@ impl Client {
                     };
 
                     if let Ok(res) = tokio::time::timeout_at(instant.into(), fut).await {
-                        res
+                        res.map(|res| res.map(Body::new))
                     } else {
                         let mut resp = Response::new(Body::empty());
                         *resp.status_mut() = StatusCode::REQUEST_TIMEOUT;
@@ -302,7 +304,10 @@ impl Default for HttpsConnector {
                 let _res = root_store.add(cert);
             }
 
-            let mut config = ClientConfig::builder()
+            let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+            let mut config = ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
 
@@ -367,20 +372,22 @@ impl Service<Uri> for HttpsConnector {
 
         Box::pin(async move {
             let tls_stream = connector.secure_connect(req).await?;
-            Ok(TlsConnection { inner: tls_stream })
+            Ok(TlsConnection {
+                inner: TokioIo::new(tls_stream),
+            })
         })
     }
 }
 
 struct TlsConnection {
-    inner: TlsStream<TcpStream>,
+    inner: TokioIo<TlsStream<TcpStream>>,
 }
 
 impl Connection for TlsConnection {
     fn connected(&self) -> Connected {
         let connected = Connected::new();
 
-        if self.inner.get_ref().1.alpn_protocol() == Some(b"h2") {
+        if self.inner.inner().get_ref().1.alpn_protocol() == Some(b"h2") {
             connected.negotiated_h2()
         } else {
             connected
@@ -388,17 +395,17 @@ impl Connection for TlsConnection {
     }
 }
 
-impl AsyncRead for TlsConnection {
+impl hyper::rt::Read for TlsConnection {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
         std::pin::pin!(&mut self.get_mut().inner).poll_read(cx, buf)
     }
 }
 
-impl AsyncWrite for TlsConnection {
+impl hyper::rt::Write for TlsConnection {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -563,40 +570,35 @@ where
     type Data = B::Data;
     type Error = B::Error;
 
-    fn poll_data(
+    fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let this = unsafe { self.get_unchecked_mut() };
-        match unsafe { std::task::ready!(Pin::new_unchecked(&mut this.body).poll_data(cx)) } {
+        let inner_frame =
+            unsafe { std::task::ready!(Pin::new_unchecked(&mut this.body).poll_frame(cx)) };
+        match inner_frame {
             None => Poll::Ready(None),
-            Some(Ok(data_frame)) => {
-                this.data_frames += 1;
-                this.body_size += data_frame.remaining() as i64;
-
-                Poll::Ready(Some(Ok(data_frame)))
-            }
             Some(Err(err)) => {
                 this.span.set_status(Status::error(err.to_string()));
 
                 Poll::Ready(Some(Err(err)))
             }
-        }
-    }
+            Some(Ok(data_frame)) if data_frame.is_data() => {
+                this.data_frames += 1;
+                if let Some(data) = data_frame.data_ref() {
+                    this.body_size += data.remaining() as i64;
+                }
 
-    fn poll_trailers(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<HeaderMap>, Self::Error>> {
-        let this = unsafe { self.get_unchecked_mut() };
-        this.span
-            .set_attribute(trace::HTTP_RESPONSE_BODY_SIZE, this.body_size);
-        this.span
-            .set_attribute("http.response.body.data_frames", this.data_frames);
+                Poll::Ready(Some(Ok(data_frame)))
+            }
+            Some(Ok(trailer_frame)) => {
+                this.span
+                    .set_attribute(attribute::HTTP_RESPONSE_BODY_SIZE, this.body_size);
+                this.span
+                    .set_attribute("http.response.body.data_frames", this.data_frames);
 
-        match unsafe { std::task::ready!(Pin::new_unchecked(&mut this.body).poll_trailers(cx)) } {
-            Ok(trailers) => {
-                if let Some(t) = &trailers {
+                if let Some(t) = trailer_frame.trailers_ref() {
                     for (h, v) in t {
                         if v.is_sensitive() {
                             continue;
@@ -609,12 +611,7 @@ where
                     }
                 }
 
-                Poll::Ready(Ok(trailers))
-            }
-            Err(err) => {
-                this.span.set_status(Status::error(err.to_string()));
-
-                Poll::Ready(Err(err))
+                Poll::Ready(Some(Ok(trailer_frame)))
             }
         }
     }

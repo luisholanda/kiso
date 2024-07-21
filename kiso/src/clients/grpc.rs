@@ -11,9 +11,11 @@ use std::{
 use axum::http::HeaderValue;
 use bytes::Buf;
 use futures_util::{future::BoxFuture, FutureExt, TryStreamExt};
-use hyper::{body::HttpBody, Request, Response};
+use http_body::Frame;
+use http_body_util::BodyExt;
+use hyper::{body::Body as HttpBody, Request, Response};
 use opentelemetry::trace::Status;
-use opentelemetry_semantic_conventions::trace;
+use opentelemetry_semantic_conventions::{attribute, trace};
 use tokio::{sync::mpsc::Sender, task::AbortHandle};
 use tonic::{
     body::BoxBody,
@@ -57,7 +59,7 @@ pub struct GrpcChannel {
     inner: Buffer<
         BoxService<
             Request<BoxBody>,
-            Response<TracedBody<LogMsgsBody<hyper::Body>>>,
+            Response<TracedBody<LogMsgsBody<BoxBody>>>,
             tonic::transport::Error,
         >,
         Request<BoxBody>,
@@ -86,7 +88,7 @@ impl GrpcChannel {
 
         let service = ServiceBuilder::new()
             .boxed()
-            .map_response(|res: Response<LogMsgsBody<hyper::Body>>| res.map(TracedBody::new))
+            .map_response(|res: Response<LogMsgsBody<BoxBody>>| res.map(TracedBody::new))
             .layer(https_settings.take_request_sensitive_headers_layer())
             .layer(https_settings.take_response_sensitive_headers_layer())
             .layer_fn(|inner| super::retry::RetryService { inner })
@@ -148,7 +150,7 @@ impl Drop for Aborter {
 }
 
 impl Service<Request<BoxBody>> for GrpcChannel {
-    type Response = Response<TracedBody<LogMsgsBody<hyper::Body>>>;
+    type Response = Response<TracedBody<LogMsgsBody<BoxBody>>>;
     type Error = Box<dyn Error + Send + Sync + 'static>;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
@@ -333,38 +335,31 @@ where
     type Data = B::Data;
     type Error = B::Error;
 
-    fn poll_data(
+    fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = unsafe { self.get_unchecked_mut() };
-        match unsafe { std::task::ready!(Pin::new_unchecked(&mut this.body).poll_data(cx)?) } {
-            None => Poll::Ready(None),
-            Some(data_frame) => {
-                crate::debug!(
-                    "{}: {} message {} with size {}",
-                    this.rpc_name,
-                    this.counter,
-                    this.typ,
-                    data_frame.remaining()
-                )
-                .attr(
-                    trace::MESSAGE_COMPRESSED_SIZE,
-                    data_frame.remaining() as i64,
-                )
-                .attr(trace::MESSAGE_ID, this.counter)
-                .attr(trace::MESSAGE_TYPE, this.typ);
+        let inner_frame =
+            unsafe { std::task::ready!(Pin::new_unchecked(&mut this.body).poll_frame(cx)?) };
 
-                Poll::Ready(Some(Ok(data_frame)))
-            }
+        if let Some(data_frame) = inner_frame.as_ref().and_then(|f| f.data_ref()) {
+            crate::debug!(
+                "{}: {} message {} with size {}",
+                this.rpc_name,
+                this.counter,
+                this.typ,
+                data_frame.remaining()
+            )
+            .attr(
+                attribute::RPC_MESSAGE_COMPRESSED_SIZE,
+                data_frame.remaining() as i64,
+            )
+            .attr(attribute::RPC_MESSAGE_ID, this.counter)
+            .attr(attribute::RPC_MESSAGE_TYPE, this.typ);
         }
-    }
 
-    fn poll_trailers(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<Option<hyper::HeaderMap>, Self::Error>> {
-        unsafe { self.map_unchecked_mut(|b| &mut b.body) }.poll_trailers(cx)
+        Poll::Ready(inner_frame.map(Ok))
     }
 
     fn is_end_stream(&self) -> bool {

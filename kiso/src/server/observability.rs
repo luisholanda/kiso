@@ -1,17 +1,15 @@
 use std::{
     collections::HashMap,
     future::Future,
-    net::SocketAddr,
     sync::Arc,
     task::{Context, Poll},
 };
 
-use axum::extract::{connect_info::Connected, ConnectInfo, MatchedPath};
+use axum::extract::{ConnectInfo, MatchedPath};
 use futures_util::future::BoxFuture;
 use hyper::{
     header::{CONTENT_ENCODING, USER_AGENT},
     http::HeaderName,
-    server::conn::AddrStream,
     Method, Request, Response,
 };
 use opentelemetry::{
@@ -22,6 +20,7 @@ use opentelemetry_semantic_conventions::trace;
 use tonic::Code;
 use tower::Service;
 
+use super::listener::Addrs;
 use crate::observability::tracing::{Span, SpanBuilder};
 
 #[derive(Clone)]
@@ -215,20 +214,5 @@ where
 
             Ok(res)
         }))
-    }
-}
-
-#[derive(Clone)]
-pub(super) struct Addrs {
-    peer: SocketAddr,
-    local: SocketAddr,
-}
-
-impl Connected<&'_ AddrStream> for Addrs {
-    fn connect_info(target: &'_ AddrStream) -> Self {
-        Self {
-            peer: target.remote_addr(),
-            local: target.local_addr(),
-        }
     }
 }
