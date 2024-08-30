@@ -32,7 +32,7 @@ crate::settings!(pub(crate) RuntimeSettings {
     ///
     /// This reduces the number of CPU cache misses, by ensuring a task is always
     /// executed in the same core.
-    runtime_pin_threads: bool = true,
+    runtime_pin_threads: bool = false,
     /// The number of threads to pin per CPU core.
     ///
     /// Default to 2.

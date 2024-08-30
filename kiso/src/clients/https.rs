@@ -10,7 +10,7 @@ use std::{
 
 use axum::{
     body::{Body, HttpBody},
-    http::{header, request::Parts, HeaderMap, HeaderValue},
+    http::{header, request::Parts, HeaderValue},
 };
 use bytes::{Buf, BufMut, BytesMut};
 use futures_util::future::BoxFuture;
@@ -35,11 +35,9 @@ use tower_http::{
     decompression::{DecompressionBody, DecompressionLayer},
     sensitive_headers::{SetSensitiveRequestHeadersLayer, SetSensitiveResponseHeadersLayer},
 };
+use tracing::Instrument;
 
-use crate::{
-    context::Deadline,
-    observability::tracing::{Span, SpanKind, Status},
-};
+use crate::{context::Deadline, tracing::TraceContext};
 
 pub type ClientBody = DecompressionBody<TracedBody<Body>>;
 
@@ -448,15 +446,28 @@ where
 
     fn call(&mut self, req: Request<B1>) -> Self::Future {
         #[inline(never)]
-        fn build_span(parts: &mut Parts) -> Span {
-            let mut builder = Span::builder(parts.method.to_string(), SpanKind::Client);
+        fn build_span(parts: &mut Parts) -> tracing::Span {
+            let span = tracing::info_span!("http.client.request",
+                otel.name = %parts.method,
+                otel.span_kind = "client",
+                // assume request will be successful, we can fix it later.
+                otel.status_code = "ok",
+                error = tracing::field::Empty,
+                {trace::HTTP_REQUEST_METHOD} = %parts.method,
+                {trace::URL_FULL} = %parts.uri,
+                {trace::SERVER_ADDRESS} = tracing::field::Empty,
+                {trace::SERVER_PORT} = tracing::field::Empty,
+                {trace::HTTP_RESPONSE_STATUS_CODE} = tracing::field::Empty,
 
-            builder = builder
-                .attr(trace::HTTP_REQUEST_METHOD, parts.method.to_string())
-                .attr(trace::URL_FULL, parts.uri.to_string());
+                // gRPC specific.
+                {trace::RPC_SYSTEM} = tracing::field::Empty,
+                {trace::RPC_SERVICE} = tracing::field::Empty,
+                {trace::RPC_METHOD} = tracing::field::Empty,
+                {trace::RPC_GRPC_STATUS_CODE} = tracing::field::Empty,
+            );
 
             if let Some(h) = parts.uri.host() {
-                builder = builder.attr(trace::SERVER_ADDRESS, h.to_string());
+                span.record(trace::SERVER_ADDRESS, h.to_string());
             }
 
             'port: {
@@ -468,86 +479,66 @@ where
                     break 'port;
                 };
 
-                builder = builder.attr(trace::SERVER_PORT, p);
+                span.record(trace::SERVER_PORT, p);
             }
 
-            for (h, v) in &parts.headers {
-                if v.is_sensitive() {
-                    continue;
+            TraceContext::with_span(&span, |trace_ctx| {
+                if let Ok(tracestate) =
+                    HeaderValue::from_str(&trace_ctx.span_context().trace_state().header())
+                {
+                    parts.headers.insert("tracestate", tracestate);
                 }
 
-                if let Ok(v) = v.to_str() {
-                    builder = builder.attr(format!("http.request.header.{h}"), v.to_string());
+                let traceparent = trace_ctx.to_w3c_traceparent();
+
+                if let Ok(traceparent) = HeaderValue::from_str(&traceparent) {
+                    parts.headers.insert("traceparent", traceparent);
                 }
-            }
-
-            let span = builder.start();
-
-            if let Ok(tracestate) =
-                HeaderValue::from_str(&span.span_context().trace_state().header())
-            {
-                parts.headers.insert("tracestate", tracestate);
-            }
-
-            let traceparent = span.to_w3c_traceparent();
-
-            if let Ok(traceparent) = HeaderValue::from_str(&traceparent) {
-                parts.headers.insert("traceparent", traceparent);
-            }
+            });
 
             span
         }
 
         #[inline(never)]
-        fn after_response(span: Span, status: StatusCode, headers: &HeaderMap) {
+        fn after_response(span: tracing::Span, status: StatusCode) {
             if status.is_client_error() || status.is_server_error() {
                 // we can't get any meaningful description without reading the body.
-                span.set_status(Status::error(""));
+                span.record("otel.status_code", "error");
             }
 
-            span.set_attribute(trace::HTTP_RESPONSE_STATUS_CODE, status.as_u16() as i64);
-
-            for (h, v) in headers {
-                if v.is_sensitive() {
-                    continue;
-                }
-
-                if let Ok(v) = v.to_str() {
-                    span.set_attribute(format!("http.response.header.{h}"), v.to_string());
-                }
-            }
+            span.record(trace::HTTP_RESPONSE_STATUS_CODE, status.as_u16());
         }
 
         let (mut parts, body) = req.into_parts();
 
         let span = build_span(&mut parts);
 
-        let req = Request::from_parts(parts, body);
+        let fut = span.in_scope(|| self.inner.call(Request::from_parts(parts, body)));
 
-        let fut = crate::context::scope_sync(span.clone(), || self.inner.call(req));
+        let span1 = span.clone();
+        Box::pin(
+            async move {
+                let res = match fut.await {
+                    Ok(res) => res,
+                    Err(err) => {
+                        span.record("error", tracing::field::display(&err));
+                        return Err(err);
+                    }
+                };
 
-        Box::pin(crate::context::scope(span, async move {
-            let span = crate::context::current::<Span>();
+                after_response(span, res.status());
 
-            let res = match fut.await {
-                Ok(res) => res,
-                Err(err) => {
-                    span.set_status(Status::error(err.to_string()));
-                    return Err(err);
-                }
-            };
-
-            after_response(span, res.status(), res.headers());
-
-            Ok(res)
-        }))
+                Ok(res)
+            }
+            .instrument(span1),
+        )
     }
 }
 
 /// A [`HttpBody`] that adds a span for the duration of a body reading.
 pub struct TracedBody<B> {
     body: B,
-    span: Span,
+    span: tracing::Span,
     data_frames: i64,
     body_size: i64,
 }
@@ -556,7 +547,14 @@ impl<B> TracedBody<B> {
     pub fn new(body: B) -> Self {
         Self {
             body,
-            span: Span::builder("recv HTTP response body", SpanKind::Client).start(),
+            span: tracing::debug_span!(
+                "kiso.client.http.response.body",
+                otel.span_kind = "client",
+                otel.status_code = tracing::field::Empty,
+                error = tracing::field::Empty,
+                { attribute::HTTP_RESPONSE_BODY_SIZE } = tracing::field::Empty,
+                http.response.body.data_frames = tracing::field::Empty,
+            ),
             data_frames: 0,
             body_size: 0,
         }
@@ -580,7 +578,7 @@ where
         match inner_frame {
             None => Poll::Ready(None),
             Some(Err(err)) => {
-                this.span.set_status(Status::error(err.to_string()));
+                this.span.record("error", tracing::field::display(&err));
 
                 Poll::Ready(Some(Err(err)))
             }
@@ -594,22 +592,9 @@ where
             }
             Some(Ok(trailer_frame)) => {
                 this.span
-                    .set_attribute(attribute::HTTP_RESPONSE_BODY_SIZE, this.body_size);
+                    .record(attribute::HTTP_RESPONSE_BODY_SIZE, this.body_size);
                 this.span
-                    .set_attribute("http.response.body.data_frames", this.data_frames);
-
-                if let Some(t) = trailer_frame.trailers_ref() {
-                    for (h, v) in t {
-                        if v.is_sensitive() {
-                            continue;
-                        }
-
-                        if let Ok(v) = v.to_str() {
-                            this.span
-                                .set_attribute(format!("http.response.trailer.{h}"), v.to_string());
-                        }
-                    }
-                }
+                    .record("http.response.body.data_frames", this.data_frames);
 
                 Poll::Ready(Some(Ok(trailer_frame)))
             }

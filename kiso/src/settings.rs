@@ -143,7 +143,7 @@ impl SettingsBuilder {
             .register::<crate::server::GrpcServiceSettings>()
             .register::<crate::clients::GrpcChannelSettings>()
             .register::<crate::rt::RuntimeSettings>()
-            .register::<crate::observability::ObservabilitySettings>();
+            .register::<crate::tracing::TracingSettings>();
 
         self.cmd = self
             .cmd

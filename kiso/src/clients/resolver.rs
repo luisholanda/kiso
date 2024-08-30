@@ -115,7 +115,8 @@ impl Stream for ServiceDiscoveryStream {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => return Poll::Ready(Some(Err(err))),
                     Err(err) if err.is_panic() => {
-                        crate::error!("discovery task panicked");
+                        // TODO: Propagate the panic.
+                        tracing::warn!(name: "kiso.client.dns.resolver.failure", "Background DNS resolver panicked: {err:?}");
                         *task = crate::spawn(BackgroundDiscoverer::start(
                             this.host.clone(),
                             this.tx.clone(),
@@ -196,14 +197,10 @@ impl BackgroundDiscoverer {
             match res {
                 Ok(sleep_until) => tokio::time::sleep_until(sleep_until.into()).await,
                 Err(err) if transient_error(&err) => {
-                    crate::warn!("transient error while resolving {}: {err:?}", self.host);
                     // FIXME: add exponential backoff.
                     tokio::time::sleep(Duration::from_secs(1)).await
                 }
-                Err(err) => {
-                    crate::error!("permanently failed to resolve {}: {err:?}", self.host);
-                    return Err(err);
-                }
+                Err(err) => return Err(err),
             }
         }
 

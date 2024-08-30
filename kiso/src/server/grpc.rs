@@ -83,7 +83,7 @@ impl GrpcService {
             .map_result(|res| match res {
                 Ok(res) => Ok(res),
                 Err(err) => {
-                    crate::warn!("Error inside gRPC service stack: {err}");
+                    tracing::warn!(name: "kiso.server.grpc.stack_error", error = %err, "Error inside gRPC service stack");
                     Ok(error_response(Code::Internal))
                 }
             })
@@ -133,22 +133,23 @@ impl Service<Request<Body>> for GrpcService {
 
         let base_fut = async move {
             let res = inner.await.unwrap_or_else(|err| {
-                crate::warn!("error inside gRPC service stack: {err}");
+                tracing::error!(name: "kiso.server.grpc.stack_error", error = %err, "error inside gRPC service stack");
                 error_response(Code::Internal)
             });
 
             Ok(res)
         };
         let full_fut = async move {
-            if let Ok(res) = tokio::time::timeout_at(deadline.instant().into(), base_fut).await {
+            let fut = crate::context::scope(deadline, base_fut);
+            if let Ok(res) = tokio::time::timeout_at(deadline.instant().into(), fut).await {
                 res
             } else {
-                crate::warn!("gRPC request reached deadline");
+                tracing::warn!(name: "kiso.server.grpc.deadline_reached", "gRPC request reached deadline");
                 Ok(error_response(Code::DeadlineExceeded))
             }
         };
 
-        Box::pin(crate::context::scope(deadline, full_fut))
+        Box::pin(full_fut)
     }
 }
 

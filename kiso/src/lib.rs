@@ -6,6 +6,6 @@ pub mod server;
 /// Application settings.
 pub mod settings;
 
-pub mod observability;
+pub mod tracing;
 
-pub use self::{observability::tracing::Instrument, rt::spawn};
+pub use self::rt::spawn;

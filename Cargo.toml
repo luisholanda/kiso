@@ -30,8 +30,10 @@ signal-hook = "0.3.17"
 socket2 = { version = "0.5.7", features = ["all"] }
 tokio-rustls = "0.26.0"
 tokio-util = { version = "0.7.11", features = ["rt"] }
-tonic-build.version = "0.12.1"
+tonic-build = "0.12.1"
 tonic-health = { version = "0.12.1", default-features = false }
+tracing = "0.1.40"
+tracing-log = { version = "0.2.0", features = ["interest-cache"] }
 
 [workspace.dependencies.axum]
 version = "0.7.5"
@@ -71,6 +73,11 @@ features = [
   "decompression-zstd",
   "timeout",
 ]
+
+[workspace.dependencies.tracing-subscriber]
+version = "0.3.18"
+default-features = false
+features = ["env-filter", "json", "smallvec", "parking_lot", "time", "registry", "ansi"]
 
 [workspace.lints.rust]
 rust_2018_idioms = "deny"
@@ -132,5 +139,4 @@ unnecessary_wraps = "warn"
 useless_format = "warn"
 
 [profile.dev]
-debug = 0
-strip = "debuginfo"
+debug = 1

@@ -204,7 +204,9 @@ where
             }
 
             if state.is_capped() {
-                crate::debug!("Cannot replay buffered body, maximum buffer length reached");
+                tracing::warn!(
+                    name: "kiso.client.request.body.retry.max_length_reached", 
+                    "Cannot replay buffered body, maximum buffer length reached");
 
                 return Poll::Ready(Some(Err(Box::new(Status::aborted(
                     "cannot replay buffered body",
@@ -248,7 +250,9 @@ where
             state.max_remaining_bytes = state.max_remaining_bytes.saturating_sub(length);
             let chunk = if state.is_capped() {
                 if !state.buf.bufs.is_empty() {
-                    crate::debug!("Buffered maximum capacity, discarding buffer");
+                    tracing::warn!(
+                        name: "kiso.client.request.body.retry.max_length_reached", 
+                        "Buffered maximum capacity, discarding buffer");
                     state.buf = Default::default();
                 }
 
@@ -422,7 +426,6 @@ mod tests {
 
         // drop the initial body to send the data to the replay
         drop(initial);
-        crate::info!("dropped initial body");
 
         tokio::spawn(async move {
             tx.send_data(", have lots of fun").await;
@@ -478,7 +481,6 @@ mod tests {
 
         // drop the initial body to send the data to the replay
         drop(initial);
-        crate::info!("dropped initial body");
 
         let mut replay2 = replay.clone();
 
@@ -488,7 +490,6 @@ mod tests {
 
         // drop the replay body to send the data to the second replay
         drop(replay);
-        crate::info!("dropped first replay body");
 
         tokio::spawn(async move {
             tx.send_data(", have lots").await;
@@ -688,7 +689,6 @@ mod tests {
         while let Some(chunk) = chunk(&mut body).await {
             s.push_str(&chunk[..]);
         }
-        crate::info!("no more data").attr("body", s.clone());
         s
     }
 

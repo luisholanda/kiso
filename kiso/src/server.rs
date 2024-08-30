@@ -70,7 +70,7 @@ impl Server {
     /// The routes are nested in the given path, i.e. if the router contains
     /// a route `/bar` and `path` is `/foo`, the route will be available in `/foo/bar`.
     pub fn add_routes(mut self, path: &str, router: axum::Router) -> Self {
-        crate::debug!("Mounting HTTP routes under {path}");
+        tracing::debug!("Mounting HTTP routes under {path}");
 
         let layer = tower::ServiceBuilder::new().layer(CompressionLayer::new());
 
@@ -101,7 +101,7 @@ impl Server {
         S::Response: IntoResponse,
         S::Future: Send,
     {
-        crate::debug!("Mounting gRPC service {}", S::NAME);
+        tracing::debug!("Mounting gRPC service {}", S::NAME);
 
         let srv_config = self.get_service_config(S::NAME);
 
@@ -121,10 +121,12 @@ impl Server {
     ///
     /// Returns a [`Shutdown`] that can be used to gracefully shutdown the server.
     pub async fn start(mut self) -> Shutdown {
-        crate::info!("Starting server...");
+        tracing::info!("Starting server...");
 
         if self.grpc_enabled {
-            crate::debug!("gRPC enabled, adding gprc.health.v1.Health service for health checking");
+            tracing::debug!(
+                "gRPC enabled, adding gprc.health.v1.Health service for health checking"
+            );
             let (mut reporter, srv) = tonic_health::server::health_reporter();
             self = self.add_grpc_service(srv);
 
@@ -140,9 +142,9 @@ impl Server {
             axum::routing::get(|| std::future::ready(StatusCode::OK)),
         );
 
-        crate::debug!("Server settings: {:#?}", self.settings);
+        tracing::debug!("Server settings: {:#?}", self.settings);
 
-        crate::info!(
+        tracing::info!(
             "Starting server tasks, {} will be created",
             self.settings.server_acceptor_tasks_count
         );
@@ -159,7 +161,7 @@ impl Server {
 
         server_tasks.close();
 
-        crate::info!(
+        tracing::info!(
             "Server started! Listening on {}:{}",
             self.settings.server_ip,
             self.settings.server_port
@@ -267,7 +269,7 @@ fn create_server_listener(
         TcpListener::from_std(socket.into())
     };
 
-    crate::debug!(
+    tracing::debug!(
         "Starting listener in {}:{}",
         settings.server_ip,
         settings.server_port
@@ -316,15 +318,20 @@ where
 
     fn call(&mut self, stream: T) -> Self::Future {
         let addrs = Addrs::connect_info(stream);
-        crate::debug!(
+        tracing::debug!(
+            name: "kiso.server.new_connection",
+            {
+                network.peer.address = %addrs.peer.ip(),
+                network.peer.port = addrs.peer.port(),
+                network.local.address = %addrs.local.ip(),
+                network.local.port = addrs.local.port(),
+            },
             "New connection accepted: {}:{} -> {}:{}",
             addrs.peer.ip(),
             addrs.peer.port(),
             addrs.local.ip(),
             addrs.local.port()
-        )
-        .attr("peer_ip", addrs.peer.ip().to_string())
-        .attr("peer_port", addrs.peer.port());
+        );
 
         self.inner.call(stream)
     }
@@ -360,10 +367,10 @@ impl Shutdown {
 
         tokio::select! {
             _ = sigterm.recv() => {
-                crate::info!("received SIGTERM, shutting down server");
+                tracing::info!("received SIGTERM, shutting down server");
             },
             _ = sigint.recv() => {
-                crate::info!("received SIGINT, shuttind down server");
+                tracing::info!("received SIGINT, shuttind down server");
             }
         }
 
@@ -372,7 +379,7 @@ impl Shutdown {
 
     fn start_shutdown(&self) {
         self.notify.notify_waiters();
-        crate::info!("Shutdown notified for server tasks");
+        tracing::info!("Shutdown notified for server tasks");
     }
 }
 

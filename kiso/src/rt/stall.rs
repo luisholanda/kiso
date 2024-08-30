@@ -215,7 +215,8 @@ impl Drop for StallGuard {
             return;
         }
 
-        let strace = backtrace::Backtrace::from(frames);
+        let mut strace = backtrace::Backtrace::from(frames);
+        strace.resolve();
 
         #[cfg(test)]
         self.detector
@@ -225,13 +226,15 @@ impl Drop for StallGuard {
         let elapsed = self.start.elapsed();
         let overage = elapsed.saturating_sub(self.detector.stall_timeout);
 
-        crate::error!(
-            "Runtime stall detected, max budget of {}ms, took {}ms, overaged by {}us",
-            self.detector.stall_timeout.as_millis(),
-            elapsed.as_millis(),
-            overage.as_micros()
-        )
-        .backtrace(strace);
+        tracing::error!(
+            name: "kiso.runtime.stall_detected",
+            {
+                budget = self.detector.stall_timeout.as_millis(),
+                task_duration = elapsed.as_millis(),
+                overage = overage.as_millis(),
+            },
+            "Runtime stall detected, backtrace:\n{strace:?}",
+        );
     }
 }
 

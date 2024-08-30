@@ -14,7 +14,6 @@ use futures_util::{future::BoxFuture, FutureExt, TryStreamExt};
 use http_body::Frame;
 use http_body_util::BodyExt;
 use hyper::{body::Body as HttpBody, Request, Response};
-use opentelemetry::trace::Status;
 use opentelemetry_semantic_conventions::{attribute, trace};
 use tokio::{sync::mpsc::Sender, task::AbortHandle};
 use tonic::{
@@ -27,7 +26,7 @@ use super::{
     https::{TracedBody, TracingService as HttpTracingService},
     resolver::ServiceDiscoveryStream,
 };
-use crate::{clients::HttpsClientSettings, context::Deadline, observability::tracing::Span};
+use crate::{clients::HttpsClientSettings, context::Deadline};
 
 /// A production-ready gRPC channel.
 ///
@@ -205,7 +204,10 @@ impl BackgroundResolver {
                 }
                 Ok(None) => return,
                 Err(err) => {
-                    crate::error!("resolve failure in service discovery: {err:?}");
+                    tracing::error!(
+                        name: "kiso.client.grpc.resolver.failure", 
+                        error = &err as &(dyn std::error::Error + 'static),
+                        "resolve failure in service discovery");
                     return;
                 }
             }
@@ -284,13 +286,13 @@ where
         let method = splits.next().unwrap();
         let service = splits.next().unwrap();
 
-        let span = crate::context::current::<Span>();
+        let span = tracing::Span::current();
 
         let rpc_name = format!("{service}/{method}");
-        span.update_name(rpc_name.clone());
-        span.set_attribute(trace::RPC_SYSTEM, "grpc");
-        span.set_attribute(trace::RPC_SERVICE, service.to_string());
-        span.set_attribute(trace::RPC_METHOD, method.to_string());
+        span.record("otel.name", &rpc_name);
+        span.record(trace::RPC_SYSTEM, "grpc");
+        span.record(trace::RPC_SERVICE, service);
+        span.record(trace::RPC_METHOD, method);
 
         let req = req.map(|b| LogMsgsBody::new("SENT", rpc_name.clone(), b).boxed_unsync());
         let fut = self.inner.call(req);
@@ -299,9 +301,9 @@ where
             let res = fut.await?;
 
             if let Some(status) = tonic::Status::from_header_map(res.headers()) {
-                span.set_attribute(trace::RPC_GRPC_STATUS_CODE, status.code() as i64);
+                span.record(trace::RPC_GRPC_STATUS_CODE, status.code() as i64);
                 if status.code() != tonic::Code::Ok {
-                    span.set_status(Status::error(status.message().to_string()));
+                    span.record("error", status.message());
                 }
             }
 
@@ -315,6 +317,7 @@ pub struct LogMsgsBody<B> {
     counter: i64,
     typ: &'static str,
     rpc_name: String,
+    event_name: &'static str,
 }
 
 impl<B> LogMsgsBody<B> {
@@ -324,6 +327,11 @@ impl<B> LogMsgsBody<B> {
             counter: 1,
             typ,
             rpc_name,
+            event_name: if typ == "SENT" {
+                "kiso.client.grpc.message.sent"
+            } else {
+                "kiso.client.grpc.message.recv"
+            },
         }
     }
 }
@@ -344,19 +352,19 @@ where
             unsafe { std::task::ready!(Pin::new_unchecked(&mut this.body).poll_frame(cx)?) };
 
         if let Some(data_frame) = inner_frame.as_ref().and_then(|f| f.data_ref()) {
-            crate::debug!(
+            tracing::debug!(
+                {
+                    otel.name = this.event_name,
+                    { attribute::RPC_MESSAGE_COMPRESSED_SIZE } = data_frame.remaining() as i64,
+                    { attribute::RPC_MESSAGE_ID } = this.counter,
+                    { attribute::RPC_MESSAGE_TYPE } = this.typ,
+                },
                 "{}: {} message {} with size {}",
                 this.rpc_name,
-                this.counter,
                 this.typ,
+                this.counter,
                 data_frame.remaining()
-            )
-            .attr(
-                attribute::RPC_MESSAGE_COMPRESSED_SIZE,
-                data_frame.remaining() as i64,
-            )
-            .attr(attribute::RPC_MESSAGE_ID, this.counter)
-            .attr(attribute::RPC_MESSAGE_TYPE, this.typ);
+            );
         }
 
         Poll::Ready(inner_frame.map(Ok))

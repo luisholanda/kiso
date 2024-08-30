@@ -57,10 +57,10 @@ impl Listener {
                 .await
                 .unwrap_or_else(|err| match err {});
 
-            tracker.spawn(self.run_conn(conn, conn_service));
+            crate::spawn(tracker.track_future(self.run_conn(conn, conn_service)));
         }
 
-        crate::debug!("shutdown signal received, stopping listener");
+        tracing::debug!(name: "kiso.server.listener.shutdown", "shutdown signal received, stopping listener");
 
         tracker.close();
         tracker.wait().await;
@@ -89,7 +89,7 @@ impl Listener {
                 // In most cases, the server will close FDs after some time, either due to
                 // connections being closed or other reasons. Therefore, we can just wait
                 // a little before trying to create a new connection.
-                crate::error!("accept error: {err}");
+                tracing::error!(name: "kiso.server.listener.accept_error", error = ?err);
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 None
             }

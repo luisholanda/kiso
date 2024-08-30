@@ -151,6 +151,12 @@ macro_rules! impl_context_for_type {
                 $crate::context::current::<Self>()
             }
 
+            /// Get the current value from the context stack.
+            #[inline(always)]
+            pub fn try_current() -> Option<Self> {
+                $crate::context::try_current::<Self>()
+            }
+
             /// Run the given future with this value in context.
             #[inline(always)]
             pub async fn in_scope<O>(self, fut: impl ::std::future::Future<Output = O>) -> O {

@@ -2,7 +2,7 @@ use futures_util::{
     stream::{MapOk, Repeat, Take},
     StreamExt, TryStreamExt,
 };
-use kiso::{observability::Exporters, settings::CmdDescriptor};
+use kiso::{settings::CmdDescriptor, tracing::Exporters};
 use tonic::{Request, Response, Status};
 
 tonic::include_proto!("grpc.examples.echo");
@@ -78,10 +78,9 @@ fn main() {
     .install_from_args();
 
     kiso::rt::block_on(async {
-        kiso::observability::initialize(Exporters {
-            log_exporter: opentelemetry_stdout::LogExporter::default(),
-            log_backtrace_printer: Box::new(|bc| format!("{bc:?}").into()),
+        kiso::tracing::initialize(Exporters {
             span_exporter: opentelemetry_stdout::SpanExporter::default(),
+            span_sampler: opentelemetry_sdk::trace::Sampler::AlwaysOn,
         });
 
         let echo = echo_server::EchoServer::new(EchoServer);
