@@ -1,12 +1,15 @@
 use std::{
     convert::Infallible,
-    error::Error,
+    future::Ready,
     panic::AssertUnwindSafe,
     time::{Duration, Instant},
 };
 
 use axum::{body::Body, extract::DefaultBodyLimit, http};
-use futures_util::{future::BoxFuture, Future, FutureExt as _, TryFutureExt as _};
+use futures_util::{
+    future::{BoxFuture, Either},
+    Future, FutureExt as _, TryFutureExt as _,
+};
 use hyper::{Request, Response};
 use tonic::{body::BoxBody as TonicBoxBody, Code};
 use tower::{util::BoxCloneService, Service, ServiceBuilder};
@@ -59,7 +62,7 @@ crate::settings! {
 
 #[derive(Clone)]
 pub(super) struct GrpcService {
-    inner: BoxCloneService<Request<Body>, Response<Body>, Box<dyn Error + Send + Sync>>,
+    inner: BoxCloneService<Request<Body>, Response<TonicBoxBody>, Infallible>,
     default_deadline: Duration,
     overloaded: bool,
 }
@@ -74,23 +77,16 @@ pub(super) struct ServiceConfiguration {
 impl GrpcService {
     pub(super) fn new<S>(inner: S, config: ServiceConfiguration) -> Self
     where
-        S: Service<Request<Body>, Response = Response<TonicBoxBody>> + Clone + Send + 'static,
+        S: Service<Request<Body>, Response = Response<TonicBoxBody>, Error = Infallible>
+            + Clone
+            + Send
+            + 'static,
         S::Future: Send + 'static,
-        S::Error: Error + Send + Sync + 'static,
     {
         let service = ServiceBuilder::default()
             .boxed_clone()
-            .map_result(|res| match res {
-                Ok(res) => Ok(res),
-                Err(err) => {
-                    tracing::warn!(name: "kiso.server.grpc.stack_error", error = %err, "Error inside gRPC service stack");
-                    Ok(error_response(Code::Internal))
-                }
-            })
-            .map_future(catch_panic)
-            .map_response(|res: Response<TonicBoxBody>| res.map(Body::new))
-            .load_shed()
             .concurrency_limit(config.request_concurrency_limit as usize)
+            .map_future(catch_panic)
             .layer(DefaultBodyLimit::max(config.body_limit))
             .service(inner);
 
@@ -101,7 +97,7 @@ impl GrpcService {
         }
     }
 
-    fn get_and_set_request_deadline(&self, req_start: Instant, req: &Request<Body>) -> Deadline {
+    fn get_request_deadline(&self, req_start: Instant, req: &Request<Body>) -> Deadline {
         let request_timeout = get_grpc_timeout(req).unwrap_or(self.default_deadline);
         Deadline(req_start + request_timeout)
     }
@@ -110,53 +106,48 @@ impl GrpcService {
 impl Service<Request<Body>> for GrpcService {
     type Response = Response<Body>;
     type Error = Infallible;
-    type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
+    type Future = Either<
+        BoxFuture<'static, Result<Self::Response, Self::Error>>,
+        Ready<Result<Self::Response, Self::Error>>,
+    >;
 
     #[inline(always)]
     fn poll_ready(
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), Self::Error>> {
-        self.overloaded = std::task::ready!(self.inner.poll_ready(cx)).is_err();
-
+        self.overloaded = self.inner.poll_ready(cx)?.is_pending();
         std::task::Poll::Ready(Ok(()))
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        if std::mem::take(&mut self.overloaded) {
-            return Box::pin(std::future::ready(Ok(error_response(Code::Cancelled))));
+        if self.overloaded {
+            return Either::Right(std::future::ready(Ok(error_response(
+                Code::ResourceExhausted,
+            ))));
         }
 
         let start = Instant::now();
-        let deadline = self.get_and_set_request_deadline(start, &req);
+        let deadline = self.get_request_deadline(start, &req);
         let inner = crate::context::scope_sync(deadline, || self.inner.call(req));
 
-        let base_fut = async move {
-            let res = inner.await.unwrap_or_else(|err| {
-                tracing::error!(name: "kiso.server.grpc.stack_error", error = %err, "error inside gRPC service stack");
-                error_response(Code::Internal)
-            });
-
-            Ok(res)
-        };
-        let full_fut = async move {
-            let fut = crate::context::scope(deadline, base_fut);
-            if let Ok(res) = tokio::time::timeout_at(deadline.instant().into(), fut).await {
-                res
+        Either::Left(Box::pin(async move {
+            let fut = crate::context::scope(deadline, inner);
+            if let Ok(Ok(res)) = tokio::time::timeout_at(deadline.instant().into(), fut).await {
+                Ok(res.map(Body::new))
             } else {
                 tracing::warn!(name: "kiso.server.grpc.deadline_reached", "gRPC request reached deadline");
                 Ok(error_response(Code::DeadlineExceeded))
             }
-        };
-
-        Box::pin(full_fut)
+        }))
     }
 }
 
 #[inline(always)]
-async fn catch_panic<F, E>(fut: F) -> Result<Response<Body>, E>
+async fn catch_panic<F, B, E>(fut: F) -> Result<Response<B>, E>
 where
-    F: Future<Output = Result<Response<Body>, E>>,
+    F: Future<Output = Result<Response<B>, E>>,
+    B: Default,
 {
     AssertUnwindSafe(fut)
         .catch_unwind()
@@ -167,29 +158,29 @@ where
 fn get_grpc_timeout(req: &Request<Body>) -> Option<Duration> {
     if let Some(timeout) = req.headers().get("grpc-timeout") {
         if let Ok(timeout) = timeout.to_str() {
-            let builder = match timeout.as_bytes()[timeout.len() - 1] {
-                b'n' => Duration::from_nanos,
-                b'u' => Duration::from_micros,
-                b'm' => Duration::from_millis,
-                _ => return None,
-            };
-
             let Ok(value) = timeout[..timeout.len() - 1].parse::<u64>() else {
                 return None;
             };
 
-            return Some(builder(value));
+            let dur = match timeout.as_bytes()[timeout.len() - 1] {
+                b'n' => Duration::from_nanos(value),
+                b'u' => Duration::from_micros(value),
+                b'm' => Duration::from_millis(value),
+                _ => return None,
+            };
+
+            return Some(dur);
         }
     }
 
     None
 }
 
-fn error_response(code: Code) -> Response<Body> {
+fn error_response<B: Default>(code: Code) -> Response<B> {
     Response::builder()
         .status(http::StatusCode::OK)
         .header("grpc-status", code as i32)
         .header(axum::http::header::CONTENT_TYPE, "application/grpc")
-        .body(Body::empty())
+        .body(B::default())
         .unwrap()
 }

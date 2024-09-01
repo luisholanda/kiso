@@ -57,11 +57,7 @@ features = ["codegen", "prost", "gzip", "zstd", "transport", "tls-roots"]
 [workspace.dependencies.tower]
 version = "0.4.13"
 default-features = false
-features = [
-  "buffer",
-  "limit",
-  "load-shed",
-]
+features = ["limit"]
 
 [workspace.dependencies.tower-http]
 version = "0.5.2"
