@@ -4,11 +4,10 @@
 //! to ensure optimal performance for I/O bound servers.
 use std::{
     future::Future,
-    sync::{atomic::AtomicU16, Arc},
+    sync::{atomic::AtomicU16, Arc, LazyLock},
     time::Duration,
 };
 
-use once_cell::sync::Lazy;
 use tokio::task::JoinHandle;
 
 #[cfg(target_os = "linux")]
@@ -89,7 +88,7 @@ where
     RUNTIME.spawn(fut)
 }
 
-static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     let rt_settings: RuntimeSettings = crate::settings::get();
 
     let mut builder = if rt_settings.runtime_single_cpu {

@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     net::IpAddr,
     pin::Pin,
+    sync::LazyLock,
     task::{Context, Poll},
     time::Duration,
 };
@@ -13,7 +14,6 @@ use hickory_resolver::{
     TokioAsyncResolver,
 };
 use hyper::Uri;
-use once_cell::sync::Lazy;
 use tokio::task::JoinHandle;
 use tower::discover::Change;
 
@@ -22,7 +22,7 @@ pub async fn resolve_uri(uri: &Uri) -> Result<Vec<IpAddr>, ResolveError> {
     RESOLVER.resolve_uri(uri).await
 }
 
-static RESOLVER: Lazy<NameResolver> = Lazy::new(NameResolver::default);
+static RESOLVER: LazyLock<NameResolver> = LazyLock::new(NameResolver::default);
 
 #[derive(Clone)]
 struct NameResolver {

@@ -1,14 +1,13 @@
 use core::panic;
-use std::{ffi::OsStr, marker::PhantomData, time::Duration};
+use std::{ffi::OsStr, marker::PhantomData, sync::OnceLock, time::Duration};
 
 #[doc(hidden)]
 pub mod __private {
     pub use clap;
 }
 use clap::{builder::TypedValueParser, Command};
-use once_cell::sync::OnceCell;
 
-static SETTINGS: OnceCell<Settings> = OnceCell::new();
+static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
 /// Create a new [`SettingsBuilder`], allowing one to register new
 /// settings segments.

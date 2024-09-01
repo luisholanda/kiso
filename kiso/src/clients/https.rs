@@ -3,7 +3,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, LazyLock},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -25,7 +25,6 @@ use hyper_util::{
     },
     rt::{TokioIo, TokioTimer},
 };
-use once_cell::sync::Lazy;
 use opentelemetry_semantic_conventions::{attribute, trace};
 use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
@@ -294,7 +293,7 @@ struct HttpsConnector {
 
 impl Default for HttpsConnector {
     fn default() -> Self {
-        static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
+        static TLS_CONFIG: LazyLock<Arc<ClientConfig>> = LazyLock::new(|| {
             let mut root_store = RootCertStore::empty();
             for cert in rustls_native_certs::load_native_certs()
                 .expect("failed to load native certificates")

@@ -32,7 +32,7 @@
             ];
           };
 
-          rustVersion = "1.79.0";
+          rustVersion = "1.80.1";
 
           rustcLinkFlags = [
             "-C linker=${pkgs.clang}/bin/clang"
@@ -98,6 +98,8 @@
               ghz
               rust-bin.nightly.latest.rustfmt
               protobuf
+              valgrind
+              python3
             ];
 
             RUSTC_FLAGS = rustcLinkFlags;

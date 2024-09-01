@@ -17,7 +17,6 @@ http-body-util = "0.1.2"
 hyper = { version = "1.4.1", features = ["client", "server", "http2"] }
 hyper-util = { version = "0.1.6", features = ["client", "server", "http2", "tokio"] }
 num_cpus = "1.16.0"
-once_cell = { version = "1.19.0", default-features = false, features = ["parking_lot", "alloc", "std"] }
 opentelemetry = "0.24.0"
 opentelemetry_sdk = { version = "0.24.1", features = ["rt-tokio"] }
 opentelemetry-semantic-conventions = "0.16.0"
@@ -76,8 +75,6 @@ default-features = false
 features = ["env-filter", "json", "smallvec", "parking_lot", "time", "registry", "ansi"]
 
 [workspace.lints.rust]
-rust_2018_idioms = "deny"
-
 let_underscore_drop = "warn"
 unused_imports = "warn"
 variant_size_differences = "warn"
