@@ -98,21 +98,24 @@ static RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
         tokio::runtime::Builder::new_multi_thread()
     };
 
-    if !rt_settings.runtime_single_cpu {
+    let on_thread_start = runtime_thread_start(&rt_settings);
+    if rt_settings.runtime_single_cpu {
+        on_thread_start();
+    } else {
         builder
-            .on_thread_start(runtime_thread_start(&rt_settings))
+            .on_thread_start(on_thread_start)
             .on_thread_stop(runtime_thread_stop(&rt_settings));
     }
 
     builder
         .enable_all()
         .worker_threads(rt_settings.runtime_thread_pool_size)
+        .max_blocking_threads(rt_settings.runtime_thread_pool_size)
         .event_interval(rt_settings.runtime_event_interval_ticks)
         .build()
         .expect("failed to start tokio runtime")
 });
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn runtime_thread_start(settings: &RuntimeSettings) -> impl Fn() + Send + Sync + 'static {
     let ncpus = num_cpus::get();
     let mut indexes = Vec::with_capacity(settings.runtime_pinned_threads_per_core * ncpus);
