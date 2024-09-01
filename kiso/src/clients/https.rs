@@ -466,8 +466,14 @@ where
                 {trace::RPC_GRPC_STATUS_CODE} = tracing::field::Empty,
             );
 
+            if span.is_disabled() {
+                return span;
+            }
+
+            let fields = RequestSpanFields::instance(&span);
+
             if let Some(h) = parts.uri.host() {
-                span.record(trace::SERVER_ADDRESS, h.to_string());
+                span.record(&fields.server_address, h.to_string());
             }
 
             'port: {
@@ -479,7 +485,7 @@ where
                     break 'port;
                 };
 
-                span.record(trace::SERVER_PORT, p);
+                span.record(&fields.server_port, p);
             }
 
             TraceContext::with_span(&span, |trace_ctx| {
@@ -501,12 +507,13 @@ where
 
         #[inline(never)]
         fn after_response(span: tracing::Span, status: StatusCode) {
+            let fields = RequestSpanFields::instance(&span);
             if status.is_client_error() || status.is_server_error() {
                 // we can't get any meaningful description without reading the body.
-                span.record("otel.status_code", "error");
+                span.record(&fields.otel_status_code, "error");
             }
 
-            span.record(trace::HTTP_RESPONSE_STATUS_CODE, status.as_u16());
+            span.record(&fields.http_response_status_code, status.as_u16());
         }
 
         let (mut parts, body) = req.into_parts();
@@ -515,13 +522,18 @@ where
 
         let fut = span.in_scope(|| self.inner.call(Request::from_parts(parts, body)));
 
+        if span.is_disabled() {
+            return Box::pin(fut.instrument(span));
+        }
+
         let span1 = span.clone();
         Box::pin(
             async move {
                 let res = match fut.await {
                     Ok(res) => res,
                     Err(err) => {
-                        span.record("error", tracing::field::display(&err));
+                        let fields = RequestSpanFields::instance(&span);
+                        span.record(&fields.error, tracing::field::display(&err));
                         return Err(err);
                     }
                 };
@@ -534,6 +546,19 @@ where
         )
     }
 }
+
+crate::declare_span_fields_struct!(pub(super) RequestSpanFields {
+    otel_name: "otel.name",
+    otel_status_code: "otel.status_code",
+    error: "error",
+    server_address: trace::SERVER_ADDRESS,
+    server_port: trace::SERVER_PORT,
+    http_response_status_code: trace::HTTP_RESPONSE_STATUS_CODE,
+    rpc_system: trace::RPC_SYSTEM,
+    rpc_service: trace::RPC_SERVICE,
+    rpc_method: trace::RPC_METHOD,
+    rpc_grpc_status_code: trace::RPC_GRPC_STATUS_CODE,
+});
 
 /// A [`HttpBody`] that adds a span for the duration of a body reading.
 pub struct TracedBody<B> {

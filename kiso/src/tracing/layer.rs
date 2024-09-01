@@ -181,15 +181,15 @@ where
             return;
         };
 
-        if parent.extensions().get::<Box<SpanData>>().is_none() {
-            return;
-        }
-
         let (trace_id, span_id) = {
             let extensions = parent.extensions();
             let Some(trace_ctx) = extensions.get::<TraceContext>() else {
                 return;
             };
+
+            if !trace_ctx.span_ctx.is_sampled() {
+                return;
+            }
 
             (trace_ctx.span_ctx.trace_id(), trace_ctx.span_ctx.span_id())
         };
@@ -275,18 +275,18 @@ impl tracing::field::Visit for SpanVisitor<'_> {
             SPAN_NAME_FIELD => self.0.name = value.to_string().into(),
             SPAN_KIND_FIELD => {
                 self.0.span_kind = match value {
-                    s if s.eq_ignore_ascii_case("server") => SpanKind::Server,
-                    s if s.eq_ignore_ascii_case("client") => SpanKind::Client,
-                    s if s.eq_ignore_ascii_case("producer") => SpanKind::Producer,
-                    s if s.eq_ignore_ascii_case("consumer") => SpanKind::Consumer,
-                    s if s.eq_ignore_ascii_case("internal") => SpanKind::Internal,
+                    "server" => SpanKind::Server,
+                    "client" => SpanKind::Client,
+                    "producer" => SpanKind::Producer,
+                    "consumer" => SpanKind::Consumer,
+                    "internal" => SpanKind::Internal,
                     _ => panic!("invalid span kind {value:?}"),
                 }
             }
             SPAN_STATUS_CODE_FIELD => {
                 self.0.status = match value {
-                    s if s.eq_ignore_ascii_case("ok") => opentelemetry::trace::Status::Ok,
-                    s if s.eq_ignore_ascii_case("error") => opentelemetry::trace::Status::error(""),
+                    "ok" => opentelemetry::trace::Status::Ok,
+                    "error" => opentelemetry::trace::Status::error(""),
                     _ => opentelemetry::trace::Status::Unset,
                 }
             }

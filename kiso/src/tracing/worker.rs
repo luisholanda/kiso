@@ -6,7 +6,7 @@ use std::{
 
 use flume::{Receiver, Sender};
 use opentelemetry::{
-    trace::{Event, SpanId, Status, TraceId},
+    trace::{Event, SpanId, TraceId},
     InstrumentationLibrary, Key, KeyValue,
 };
 use opentelemetry_sdk::{

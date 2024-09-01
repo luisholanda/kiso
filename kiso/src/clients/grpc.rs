@@ -14,7 +14,7 @@ use futures_util::{future::BoxFuture, FutureExt, TryStreamExt};
 use http_body::Frame;
 use http_body_util::BodyExt;
 use hyper::{body::Body as HttpBody, Request, Response};
-use opentelemetry_semantic_conventions::{attribute, trace};
+use opentelemetry_semantic_conventions::attribute;
 use tokio::{sync::mpsc::Sender, task::AbortHandle};
 use tonic::{
     body::BoxBody,
@@ -285,14 +285,17 @@ where
         let mut splits = path.rsplit('/');
         let method = splits.next().unwrap();
         let service = splits.next().unwrap();
+        let rpc_name = format!("{service}/{method}");
 
         let span = tracing::Span::current();
+        if !span.is_disabled() {
+            let fields = super::https::RequestSpanFields::instance(&span);
 
-        let rpc_name = format!("{service}/{method}");
-        span.record("otel.name", &rpc_name);
-        span.record(trace::RPC_SYSTEM, "grpc");
-        span.record(trace::RPC_SERVICE, service);
-        span.record(trace::RPC_METHOD, method);
+            span.record(&fields.otel_name, &rpc_name)
+                .record(&fields.rpc_system, "grpc")
+                .record(&fields.rpc_service, service)
+                .record(&fields.rpc_method, method);
+        }
 
         let req = req.map(|b| LogMsgsBody::new("SENT", rpc_name.clone(), b).boxed_unsync());
         let fut = self.inner.call(req);
@@ -300,10 +303,13 @@ where
         Box::pin(async move {
             let res = fut.await?;
 
-            if let Some(status) = tonic::Status::from_header_map(res.headers()) {
-                span.record(trace::RPC_GRPC_STATUS_CODE, status.code() as i64);
-                if status.code() != tonic::Code::Ok {
-                    span.record("error", status.message());
+            if !span.is_disabled() {
+                let fields = super::https::RequestSpanFields::instance(&span);
+                if let Some(status) = tonic::Status::from_header_map(res.headers()) {
+                    span.record(&fields.rpc_grpc_status_code, status.code() as i64);
+                    if status.code() != tonic::Code::Ok {
+                        span.record(&fields.error, status.message());
+                    }
                 }
             }
 

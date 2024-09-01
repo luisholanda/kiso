@@ -105,29 +105,37 @@ impl<S> TracingService<S> {
 
         let span = remote_ctx.map_or_else(make_span, |c| crate::context::scope_sync(c, make_span));
 
+        if span.is_disabled() {
+            return (span, is_grpc);
+        }
+
+        let fields = RequestSpanFields::instance(&span);
+
         if is_grpc {
             let mut splits = req.uri.path().rsplit('/');
             // FIXME: if these return None, the request is wrong.
             let method = splits.next().unwrap_or_default();
             let service = splits.next().unwrap_or_default();
 
-            span.record("otel.name", format_args!("{service}/{method}"));
-            span.record(trace::RPC_SERVICE, service);
-            span.record(trace::RPC_METHOD, method);
+            let name_start = req.uri.path().len() - 1 - method.len() - service.len();
+            span.record(&fields.otel_name, &req.uri.path()[name_start..])
+                .record(&fields.rpc_service, service)
+                .record(&fields.rpc_method, method)
+                .record(&fields.rpc_system, "grpc");
         } else if method == "_OTHER" {
-            span.record("otel.name", format_args!("HTTP {route}"));
-            span.record(trace::HTTP_REQUEST_METHOD_ORIGINAL, req.method.as_str());
+            span.record(&fields.otel_name, format_args!("HTTP {route}"))
+                .record(&fields.http_request_method_original, req.method.as_str());
         } else {
-            span.record("otel.name", format_args!("{method} {route}"));
+            span.record(&fields.otel_name, format_args!("{method} {route}"));
         };
 
         if let Some(q) = req.uri.query() {
-            span.record(trace::URL_QUERY, q.to_string());
+            span.record(&fields.url_query, q.to_string());
         }
 
         if let Some(ua) = req.headers.get(USER_AGENT) {
             if let Ok(ua) = ua.to_str() {
-                span.record(trace::USER_AGENT_ORIGINAL, ua.to_string());
+                span.record(&fields.user_agent_original, ua.to_string());
             }
         }
 
@@ -151,45 +159,77 @@ where
     }
 
     fn call(&mut self, req: Request<B1>) -> Self::Future {
+        use hyper::http::response::Parts;
+        #[inline(never)]
+        fn after_response(span: tracing::Span, parts: &Parts, is_grpc: bool) {
+            let fields = RequestSpanFields::instance(&span);
+            if is_grpc {
+                if let Some(status) = tonic::Status::from_header_map(&parts.headers) {
+                    span.record(&fields.rpc_grpc_status_code, status.code() as i64);
+
+                    if status.code() == Code::Ok {
+                        span.record(&fields.otel_status_code, "ok");
+                    } else if matches!(
+                        status.code(),
+                        Code::Unknown
+                            | Code::DeadlineExceeded
+                            | Code::Unimplemented
+                            | Code::Internal
+                            | Code::Unavailable
+                            | Code::DataLoss
+                    ) {
+                        span.record(&fields.otel_status_code, "error");
+                    }
+                }
+            } else {
+                span.record(&fields.http_response_status_code, parts.status.as_u16());
+
+                if parts.status.is_success() {
+                    span.record(&fields.otel_status_code, "ok");
+                } else if parts.status.is_server_error() {
+                    span.record(&fields.otel_status_code, "error");
+                }
+            }
+        }
+
         let (parts, body) = req.into_parts();
         let (span, is_grpc) = self.http_builder_from_req(&parts);
 
         let fut = span.in_scope(|| self.inner.call(Request::from_parts(parts, body)));
 
+        if span.is_disabled() {
+            return Box::pin(fut.instrument(span));
+        }
+
         let span1 = span.clone();
         Box::pin(
             async move {
+                let fields = RequestSpanFields::instance(&span);
                 let res = fut.await.inspect_err(|err| {
-                    span.record("error", tracing::field::display(err));
+                    span.record(&fields.error, tracing::field::display(err));
                 })?;
 
-                if is_grpc {
-                    if let Some(status) = tonic::Status::from_header_map(res.headers()) {
-                        span.record(trace::RPC_GRPC_STATUS_CODE, status.code() as i64);
+                let (parts, body) = res.into_parts();
 
-                        if matches!(
-                            status.code(),
-                            Code::Unknown
-                                | Code::DeadlineExceeded
-                                | Code::Unimplemented
-                                | Code::Internal
-                                | Code::Unavailable
-                                | Code::DataLoss
-                        ) {
-                            span.record("otel.status_code", "error");
-                        }
-                    }
-                } else {
-                    span.record(trace::HTTP_RESPONSE_STATUS_CODE, res.status().as_u16());
+                after_response(span, &parts, is_grpc);
 
-                    if res.status().is_server_error() {
-                        span.record("otel.status_code", "error");
-                    }
-                }
-
-                Ok(res)
+                Ok(Response::from_parts(parts, body))
             }
             .instrument(span1),
         )
     }
 }
+
+crate::declare_span_fields_struct!(RequestSpanFields {
+    otel_name: "otel.name",
+    otel_status_code: "otel.status_code",
+    error: "error",
+    http_request_method_original: trace::HTTP_REQUEST_METHOD_ORIGINAL,
+    http_response_status_code: trace::HTTP_RESPONSE_STATUS_CODE,
+    url_query: trace::URL_QUERY,
+    user_agent_original: trace::USER_AGENT_ORIGINAL,
+    rpc_system: trace::RPC_SYSTEM,
+    rpc_service: trace::RPC_SERVICE,
+    rpc_method: trace::RPC_METHOD,
+    rpc_grpc_status_code: trace::RPC_GRPC_STATUS_CODE,
+});
